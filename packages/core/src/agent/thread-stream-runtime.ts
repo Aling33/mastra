@@ -1,11 +1,12 @@
-import { getErrorFromUnknown } from '../error';
+import { ErrorCategory, ErrorDomain, getErrorFromUnknown, MastraError } from '../error';
 import { withAck } from '../events/acking-callback';
 import { EventEmitterPubSub } from '../events/event-emitter';
 import { isLeaseProvider, NoopLeaseProvider } from '../events/pubsub';
 import type { LeaseProvider, PubSub } from '../events/pubsub';
 import type { EventCallback } from '../events/types';
 import { parseMemoryRequestContext } from '../memory/types';
-import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../request-context';
+import type { VersionOverrides } from '../request-context';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, MASTRA_VERSIONS_KEY, RequestContext } from '../request-context';
 import type { MastraModelOutput } from '../stream/base/output';
 import { getChunkProducedAt } from '../stream/base/produced-at';
 import { isSignalChunkExcluded } from '../stream/signal-exclusions';
@@ -47,6 +48,18 @@ import type {
   SendAgentStateSignalOptions,
   SendAgentStateSignalResult,
 } from './types';
+import {
+  MASTRA_AGENT_VERSION_PINS_DELEGATED_KEY,
+  assertAgentVersionPinsOwnerIntegrity,
+  assertContinuationVersionOverrides,
+  exactVersionOverridesForPins,
+  getAgentVersionPins,
+  normalizeAgentVersionPins,
+  reconcileAgentVersionPinPayloads,
+  scopeAgentVersionPins,
+  setAgentVersionPins,
+} from './version-pins';
+import type { AgentVersionPins } from './version-pins';
 
 /**
  * DurableAgent.stream() resolves to a wrapper whose `output` is the model output;
@@ -165,6 +178,10 @@ const AGENT_THREAD_LEASE_RENEW_INTERVAL_MS = readPositiveIntEnv(
  */
 const AGENT_SUSPENDED_RUN_TTL_MS = readPositiveIntEnv('MASTRA_SUSPENDED_RUN_TTL_MS', 30 * 60 * 1000);
 
+// A completed client-tool run only needs its immutable identity, not its saved
+// message stream, for a short continuation window.
+const AGENT_THREAD_VERSION_IDENTITY_TTL_MS = 5 * 60 * 1000;
+
 export const AGENT_THREAD_LEASE_CONFLICT_CODE = 'AGENT_THREAD_LEASE_CONFLICT';
 
 export class AgentThreadLeaseConflictError extends Error {
@@ -247,6 +264,37 @@ function withThreadMemory(memory: unknown, resourceId: string, threadId: string)
   };
 }
 
+function withPinnedContinuationOptions<OUTPUT>(
+  streamOptions: AgentExecutionOptions<OUTPUT> | undefined,
+  pins: AgentVersionPins | undefined,
+  rootAgentId: string,
+  validateSelectors = true,
+): AgentExecutionOptions<OUTPUT> | undefined {
+  if (!pins) return streamOptions;
+
+  const callVersions = streamOptions?.versions;
+  const sourceRequestContext = streamOptions?.requestContext;
+  const contextVersions = (sourceRequestContext as RequestContext<unknown> | undefined)?.get(MASTRA_VERSIONS_KEY) as
+    | VersionOverrides
+    | undefined;
+  if (validateSelectors) {
+    assertContinuationVersionOverrides(callVersions, pins, rootAgentId);
+    assertContinuationVersionOverrides(contextVersions, pins, rootAgentId);
+  }
+
+  const requestContext = new RequestContext<unknown>(sourceRequestContext?.entries());
+  const exactVersions = exactVersionOverridesForPins(pins)!;
+  setAgentVersionPins(requestContext, pins);
+  requestContext.set(MASTRA_AGENT_VERSION_PINS_DELEGATED_KEY, true);
+  requestContext.set(MASTRA_VERSIONS_KEY, exactVersions);
+
+  return {
+    ...streamOptions,
+    requestContext,
+    versions: exactVersions,
+  } as AgentExecutionOptions<OUTPUT>;
+}
+
 type AgentThreadRunLifecycle = 'running' | 'suspending' | 'suspended' | 'completed' | 'failed' | 'aborted';
 
 type AgentThreadRunSuspension = {
@@ -324,6 +372,7 @@ type PendingIdleSignal<OUTPUT = unknown> = {
   resourceId: string;
   threadId: string;
   streamOptions?: AgentExecutionOptions<OUTPUT>;
+  versionPins?: AgentVersionPins;
   queueOwnerId?: string;
   cancelled?: boolean;
 };
@@ -412,6 +461,7 @@ type AgentThreadRuntimeState = {
   activeThreadRunIds: Map<string, string>;
   activeThreadStreamIds: Map<string, string>;
   streamSeqByRunId: Map<string, number>;
+  versionPinsByRunId: Map<string, AgentVersionPins>;
   approvalSuspendedRunIds: Set<string>;
   suspendedRunIds: Set<string>;
   suspensionMetadataByRunId: Map<string, Map<string | undefined, AgentThreadRunSuspension>>;
@@ -526,6 +576,13 @@ type SerializableAgentSignal = AgentSignal & Pick<CreatedAgentSignal, 'id' | 'cr
 
 type AgentThreadStreamRuntimeEvent =
   | {
+      type: 'run-version-identity';
+      sourceRunId: string;
+      agentId: string;
+      expiresAt: number;
+      versionPins?: AgentVersionPins;
+    }
+  | {
       type: 'run-registered';
       runId: string;
       streamId: string;
@@ -535,6 +592,7 @@ type AgentThreadStreamRuntimeEvent =
       generation?: number;
       /** See {@link AgentThreadRunRecord.supersedes}. */
       supersedes?: boolean;
+      versionPins?: AgentVersionPins;
     }
   | {
       type: 'stream-part';
@@ -555,6 +613,8 @@ type AgentThreadStreamRuntimeEvent =
       persisted?: boolean;
       /** The run's final status; `success` means storage holds all of it and nothing is left to act on. */
       status?: string;
+      /** Immutable identity retained just long enough for a post-finish client-tool continuation. */
+      versionPins?: AgentVersionPins;
     }
   | { type: 'run-suspended'; runId: string; streamId?: string }
   | { type: 'run-discarded'; runId: string; streamId: string }
@@ -631,6 +691,7 @@ function createRuntimeState(): AgentThreadRuntimeState {
     activeThreadRunIds: new Map(),
     activeThreadStreamIds: new Map(),
     streamSeqByRunId: new Map(),
+    versionPinsByRunId: new Map(),
     approvalSuspendedRunIds: new Set(),
     suspendedRunIds: new Set(),
     suspensionMetadataByRunId: new Map(),
@@ -1136,6 +1197,14 @@ export class AgentThreadStreamRuntime {
 
   #isSuspendedRun(state: AgentThreadRuntimeState, runId: string) {
     return state.suspendedRunIds.has(runId) || this.#isApprovalSuspendedRun(state, runId);
+  }
+
+  #getRunVersionPins(
+    state: AgentThreadRuntimeState,
+    runId: string,
+    record?: Pick<AgentThreadRunRecord<any>, 'streamOptions'>,
+  ): AgentVersionPins | undefined {
+    return getAgentVersionPins(record?.streamOptions.requestContext) ?? state.versionPinsByRunId.get(runId);
   }
 
   #isThreadBlockingRun(state: AgentThreadRuntimeState, record: AgentThreadRunRecord<any>) {
@@ -2191,6 +2260,7 @@ export class AgentThreadStreamRuntime {
       for (const waiter of pending) waiter();
     };
 
+    let versionIdentityChecked = false;
     let needsStart = resumed;
     const emitPart = async (rawPart: unknown): Promise<void> => {
       if (needsStart) {
@@ -2205,6 +2275,25 @@ export class AgentThreadStreamRuntime {
             from: ChunkFrom.AGENT,
             payload: { messageId: output.messageId },
           });
+        }
+      }
+      // Thread subscribers must learn the run's immutable version identity the
+      // same way direct-stream callers do: broadcast the resolved overrides
+      // before the first real part so a requested label can be tied to the
+      // pinned version even when the run was started by a signal or queued
+      // message. The check is deferred to the first part because pins land on
+      // the request context during run preparation, which is only guaranteed
+      // to have completed once the stream produces output. Only exact
+      // selections are broadcast — never per-caller continuation tokens, which
+      // must not reach other subscribers.
+      if (!versionIdentityChecked) {
+        versionIdentityChecked = true;
+        const runtimeState = runtime.#getState(pubsub);
+        const resolvedOverrides = exactVersionOverridesForPins(
+          runtime.#getRunVersionPins(runtimeState, output.runId, runtimeState.threadRunsById.get(output.runId)),
+        );
+        if (resolvedOverrides?.self) {
+          await emitPart({ type: 'resolved-version-overrides', payload: resolvedOverrides });
         }
       }
       let isSuspensionBoundary = false;
@@ -2235,7 +2324,10 @@ export class AgentThreadStreamRuntime {
         producedAt,
         // `start` and prompts stay on the topic until the run is trimmed as a
         // whole, so a subscriber joining mid-run still sees the run begin.
-        ...(partType === 'start' || partType === 'tool-call-approval' || partType === 'tool-call-suspended'
+        ...(partType === 'start' ||
+        partType === 'resolved-version-overrides' ||
+        partType === 'tool-call-approval' ||
+        partType === 'tool-call-suspended'
           ? { pinned: true }
           : {}),
       });
@@ -2609,6 +2701,121 @@ export class AgentThreadStreamRuntime {
     return activeRunId;
   }
 
+  /** @internal Rehydrate immutable run pins from retained thread registration history. */
+  async hydrateThreadRunVersionPins(
+    options: AgentSubscribeToThreadOptions & { agentId?: string; runId?: string },
+    pubsub?: PubSub,
+  ): Promise<{ runId: string; versionPins?: AgentVersionPins } | undefined> {
+    const resolvedPubSub = this.#getPubSub(pubsub);
+    const state = this.#getState(resolvedPubSub);
+    const key = this.#threadKey(options.resourceId, options.threadId);
+    const knownRunId = options.runId ?? state.activeThreadRunIds.get(key);
+    const knownPins = knownRunId ? state.versionPinsByRunId.get(knownRunId) : undefined;
+    const knownRunExists =
+      !!knownRunId && (state.threadRunsById.has(knownRunId) || state.activeThreadRunIds.get(key) === knownRunId);
+
+    const history = await resolvedPubSub.getHistory(this.#threadTopic(key)).catch(() => []);
+    let candidateRunId = options.runId ?? knownRunId;
+    for (let index = history.length - 1; index >= 0; index--) {
+      const data = history[index]?.data as AgentThreadStreamRuntimeEvent | undefined;
+      if (!data) continue;
+      if (data.type === 'run-version-identity') {
+        candidateRunId ??= data.sourceRunId;
+        break;
+      }
+      if ('runId' in data) {
+        candidateRunId ??= data.runId;
+        break;
+      }
+    }
+    if (candidateRunId) {
+      const matchingEvents = history
+        .map(entry => entry?.data as AgentThreadStreamRuntimeEvent | undefined)
+        .filter(
+          (data): data is AgentThreadStreamRuntimeEvent =>
+            !!data &&
+            (data.type === 'run-version-identity'
+              ? data.sourceRunId === candidateRunId
+              : 'runId' in data && data.runId === candidateRunId),
+        );
+      let latestLifecycleEvent: AgentThreadStreamRuntimeEvent | undefined;
+      for (let index = matchingEvents.length - 1; index >= 0; index--) {
+        const data = matchingEvents[index]!;
+        if (
+          data.type === 'run-registered' ||
+          data.type === 'run-completed' ||
+          data.type === 'run-aborted' ||
+          data.type === 'run-failed' ||
+          data.type === 'run-discarded'
+        ) {
+          latestLifecycleEvent = data;
+          break;
+        }
+      }
+      const unavailableLifecycle =
+        latestLifecycleEvent?.type === 'run-aborted' ||
+        latestLifecycleEvent?.type === 'run-failed' ||
+        latestLifecycleEvent?.type === 'run-discarded';
+      const retainedIdentities = matchingEvents.filter(
+        (data): data is Extract<AgentThreadStreamRuntimeEvent, { type: 'run-version-identity' }> =>
+          data.type === 'run-version-identity',
+      );
+      const expiredIdentity =
+        !knownRunExists &&
+        !knownPins &&
+        latestLifecycleEvent?.type !== 'run-registered' &&
+        retainedIdentities.some(identity => !Number.isFinite(identity.expiresAt) || identity.expiresAt <= Date.now());
+      if (retainedIdentities.some(identity => options.agentId && identity.agentId !== options.agentId)) {
+        throw new MastraError({
+          id: 'PINNED_VERSION_INVALID',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: 'The retained continuation identity belongs to a different agent.',
+          details: { runId: candidateRunId, agentId: options.agentId ?? '' },
+        });
+      }
+
+      const historyPinPayloads = matchingEvents
+        .filter(
+          (
+            data,
+          ): data is Extract<
+            AgentThreadStreamRuntimeEvent,
+            { type: 'run-registered' | 'run-completed' | 'run-version-identity' }
+          > => data.type === 'run-registered' || data.type === 'run-completed' || data.type === 'run-version-identity',
+        )
+        .map(data => data.versionPins)
+        .filter(pins => pins !== undefined);
+      const validatedPayloads = [knownPins, ...historyPinPayloads].map(pins => {
+        const normalized = normalizeAgentVersionPins(pins);
+        return options.agentId ? assertAgentVersionPinsOwnerIntegrity(normalized, options.agentId) : normalized;
+      });
+      const reconciledPins = reconcileAgentVersionPinPayloads(...validatedPayloads);
+      const versionPins = options.agentId
+        ? assertAgentVersionPinsOwnerIntegrity(reconciledPins, options.agentId)
+        : reconciledPins;
+      const hasRegisteredHistory = matchingEvents.some(data => data.type === 'run-registered');
+      if (
+        !unavailableLifecycle &&
+        !expiredIdentity &&
+        (knownRunExists ||
+          knownPins ||
+          hasRegisteredHistory ||
+          historyPinPayloads.length > 0 ||
+          retainedIdentities.length > 0)
+      ) {
+        return { runId: candidateRunId, versionPins };
+      }
+    }
+    throw new MastraError({
+      id: 'PINNED_VERSION_REQUIRED',
+      domain: ErrorDomain.AGENT,
+      category: ErrorCategory.USER,
+      text: 'Cannot continue the thread run because its version-selection state is unavailable or expired.',
+      details: { ...(candidateRunId ? { runId: candidateRunId } : {}), threadId: options.threadId },
+    });
+  }
+
   /** Same predicate as {@link getActiveThreadRunId}, over every tracked thread. */
   listActiveThreadRuns(pubsub?: PubSub): ActiveThreadRun[] {
     const state = this.#getState(pubsub);
@@ -2828,6 +3035,7 @@ export class AgentThreadStreamRuntime {
     state.advertisedThreadPeers.clear();
     state.activeThreadStreamIds.clear();
     state.streamSeqByRunId.clear();
+    state.versionPinsByRunId.clear();
     state.watchedThreadStreamIds.clear();
     for (const preparedRun of state.preparedRunsById.values()) {
       if (preparedRun.finalizerToken) this.#threadlessRunFinalizer?.unregister(preparedRun.finalizerToken);
@@ -3031,6 +3239,7 @@ export class AgentThreadStreamRuntime {
       const staleKey = this.#threadKey(record.resourceId, record.threadId);
       state.threadRunsById.delete(record.runId);
       state.threadKeysByRunId.delete(record.runId);
+      state.versionPinsByRunId.delete(record.runId);
       this.#clearSuspendedRun(state, record.runId);
       this.#stopLeaseRenewal(this.#getPubSub(pubsub), record.runId);
       if (
@@ -3184,6 +3393,7 @@ export class AgentThreadStreamRuntime {
           ? { sourceOutput: output, canContinue: canContinueBroadcast, didPublishTerminal }
           : undefined,
     };
+    const versionPins = getAgentVersionPins(streamOptions.requestContext);
 
     state.threadRunsById.set(output.runId, record);
     state.threadRunsByStreamId.set(streamId, record);
@@ -3191,6 +3401,7 @@ export class AgentThreadStreamRuntime {
     state.activeThreadRunIds.set(key, output.runId);
     state.activeThreadStreamIds.set(key, streamId);
     state.lostRunsByThread.delete(key);
+    if (versionPins) state.versionPinsByRunId.set(output.runId, versionPins);
     const resolvedPubSub = this.#getPubSub(pubsub);
     const registered = (async () => {
       await this.#ensureThreadControlSubscription(state, resolvedPubSub, key).ready;
@@ -3221,6 +3432,7 @@ export class AgentThreadStreamRuntime {
         sourceId: this.#getSourceId(),
         agentId: agent.id,
         generation: registrationOptions?.generation,
+        versionPins,
       });
     })();
     // Always drive the run's stream to completion, even when no caller consumes
@@ -3302,6 +3514,7 @@ export class AgentThreadStreamRuntime {
           ? { sourceOutput: output, canContinue: canContinueBroadcast, didPublishTerminal }
           : undefined,
     };
+    const versionPins = getAgentVersionPins(streamOptions.requestContext);
 
     let rolledBack = false;
     let registrationPublished = false;
@@ -3322,6 +3535,7 @@ export class AgentThreadStreamRuntime {
         if (state.threadKeysByRunId.get(record.runId) === key) {
           state.threadKeysByRunId.delete(record.runId);
         }
+        state.versionPinsByRunId.delete(record.runId);
       }
       if (
         state.activeThreadRunIds.get(key) === record.runId &&
@@ -3356,6 +3570,7 @@ export class AgentThreadStreamRuntime {
     state.threadKeysByRunId.set(output.runId, key);
     state.activeThreadRunIds.set(key, output.runId);
     state.activeThreadStreamIds.set(key, streamId);
+    if (versionPins) state.versionPinsByRunId.set(output.runId, versionPins);
 
     try {
       await this.#ensureThreadControlSubscription(state, resolvedPubSub, key).ready;
@@ -3368,6 +3583,7 @@ export class AgentThreadStreamRuntime {
         agentId: agent.id,
         generation: registrationOptions.generation,
         supersedes: record.supersedes,
+        versionPins,
       });
       registrationPublished = true;
       await registrationOptions.validate?.();
@@ -3458,6 +3674,7 @@ export class AgentThreadStreamRuntime {
       }
       state.watchedThreadStreamIds.delete(record.streamId);
       if (isDisabled?.()) return;
+      const terminalVersionPins = this.#getRunVersionPins(state, record.runId, record);
 
       if (record.output.status === 'suspended' && this.#isSuspendedRun(state, record.runId)) {
         void this.#publishRunSuspended(pubsub, key, record).catch(() => {});
@@ -3470,6 +3687,7 @@ export class AgentThreadStreamRuntime {
       if (state.threadRunsById.get(record.runId) === record) {
         state.threadRunsById.delete(record.runId);
         state.threadKeysByRunId.delete(record.runId);
+        state.versionPinsByRunId.delete(record.runId);
       }
 
       if (
@@ -3498,16 +3716,32 @@ export class AgentThreadStreamRuntime {
         // Suspended runs save their messages too, so their parts are backed by
         // storage; only a successful run leaves nothing actionable to trim.
         const persisted = record.output.status === 'success' || record.output.status === 'suspended';
-        void this.#publishAndWait(pubsub, key, {
-          type: 'run-completed',
-          runId: record.runId,
-          streamId: record.streamId,
-          // Origin-side truth for replay filtering: only a successful run flushed
-          // its messages to storage, so only its retained chunks are backed by a
-          // persisted message and safe to replay to fresh subscribers.
-          persisted,
-          status: record.output.status,
-        })
+        // Keep a compact, expiring continuation identity separate from this
+        // run's retained messages before the normal full-run trim removes them.
+        const retainedIdentity =
+          record.output.status === 'success'
+            ? this.#retainCompletedRunVersionIdentity(
+                pubsub,
+                key,
+                record.runId,
+                record.agent.id,
+                terminalVersionPins,
+              ).catch(() => {})
+            : Promise.resolve();
+        void retainedIdentity
+          .then(() =>
+            this.#publishAndWait(pubsub, key, {
+              type: 'run-completed',
+              runId: record.runId,
+              streamId: record.streamId,
+              // Origin-side truth for replay filtering: only a successful run flushed
+              // its messages to storage, so only its retained chunks are backed by a
+              // persisted message and safe to replay to fresh subscribers.
+              persisted,
+              status: record.output.status,
+              versionPins: terminalVersionPins,
+            }),
+          )
           .then(() =>
             record.output.status === 'success'
               ? this.#trimSavedRun(pubsub, key, record)
@@ -3538,6 +3772,36 @@ export class AgentThreadStreamRuntime {
         }
       });
     });
+  }
+
+  async #retainCompletedRunVersionIdentity(
+    pubsub: PubSub | undefined,
+    key: string,
+    sourceRunId: string,
+    agentId: string,
+    versionPins: AgentVersionPins | undefined,
+  ) {
+    const resolvedPubSub = this.#getPubSub(pubsub);
+    const topic = this.#threadTopic(key);
+    const retentionId = `version-identity:${globalThis.crypto.randomUUID()}`;
+    await resolvedPubSub.publish(topic, {
+      type: 'run-version-identity',
+      // This control record is not part of the completed message stream.
+      runId: retentionId,
+      data: {
+        type: 'run-version-identity',
+        sourceRunId,
+        agentId,
+        expiresAt: Date.now() + AGENT_THREAD_VERSION_IDENTITY_TTL_MS,
+        versionPins,
+      } satisfies AgentThreadStreamRuntimeEvent,
+    });
+    // The timestamp is checked on every read even if the origin exits before
+    // this best-effort cleanup. Do not retain the agent, output, or run record.
+    const timer = setTimeout(() => {
+      void resolvedPubSub.trimTopic(topic, { runId: retentionId }).catch(() => {});
+    }, AGENT_THREAD_VERSION_IDENTITY_TTL_MS);
+    timer.unref?.();
   }
 
   /**
@@ -3696,14 +3960,20 @@ export class AgentThreadStreamRuntime {
           state.preRunSignalsByThread.set(key, [...batched, ...(state.preRunSignalsByThread.get(key) ?? [])]);
         }
 
+        const pinnedStreamOptions = withPinnedContinuationOptions(
+          previousRun.streamOptions,
+          scopeAgentVersionPins(this.#getRunVersionPins(state, previousRun.runId, previousRun), previousRun.agent.id),
+          previousRun.agent.id,
+          false,
+        );
         state.startingQueuedRunIds.add(nextRunId);
         const output = await previousRun.agent.stream(signal, {
-          ...(previousRun.streamOptions as any),
+          ...(pinnedStreamOptions as any),
           // Cancellation belongs to the finished run, not its queued follow-up.
           abortSignal: undefined,
           runId: nextRunId,
           memory: withThreadMemory(
-            previousRun.streamOptions.memory,
+            pinnedStreamOptions?.memory,
             previousRun.resourceId ?? '',
             previousRun.threadId ?? '',
           ),
@@ -3885,23 +4155,39 @@ export class AgentThreadStreamRuntime {
   continueWithMessages<OUTPUT = unknown>(
     agent: Agent<any, any, any, any>,
     messages: MessageListInput,
-    target: { resourceId: string; threadId: string; streamOptions?: AgentExecutionOptions<OUTPUT>; runId?: string },
+    target: {
+      resourceId: string;
+      threadId: string;
+      streamOptions?: AgentExecutionOptions<OUTPUT>;
+      /** ID to assign to the new continuation run. */
+      runId?: string;
+      /** Existing run whose immutable pins this continuation consumes. */
+      sourceRunId?: string;
+      /** Pins rehydrated from retained history when the source run is no longer live locally. */
+      sourceVersionPins?: AgentVersionPins;
+    },
     pubsub?: PubSub,
   ): { accepted: true; runId: string } {
     const state = this.#getState(pubsub);
     const key = this.#threadKey(target.resourceId, target.threadId);
     const runId = target.runId ?? globalThis.crypto.randomUUID();
+    const activeRunId = state.activeThreadRunIds.get(key);
+    const activeRecord = activeRunId ? state.threadRunsById.get(activeRunId) : undefined;
+    const sourceRunId = target.sourceRunId ?? activeRunId;
+    const continuationPins = scopeAgentVersionPins(
+      target.sourceVersionPins ??
+        this.#getRunVersionPins(state, sourceRunId ?? '', sourceRunId === activeRunId ? activeRecord : undefined),
+      agent.id,
+    );
     const pending: PendingContinuation<OUTPUT> = {
       agent,
       messages,
       runId,
       resourceId: target.resourceId,
       threadId: target.threadId,
-      streamOptions: target.streamOptions,
+      streamOptions: withPinnedContinuationOptions(target.streamOptions, continuationPins, agent.id),
     };
 
-    const activeRunId = state.activeThreadRunIds.get(key);
-    const activeRecord = activeRunId ? state.threadRunsById.get(activeRunId) : undefined;
     if (state.activeThreadRunIds.has(key)) {
       const queue = state.pendingContinuationsByThread.get(key) ?? [];
       queue.push(pending);
@@ -4044,13 +4330,19 @@ export class AgentThreadStreamRuntime {
     }
 
     try {
+      const pinnedStreamOptions = withPinnedContinuationOptions(
+        pendingIdle.streamOptions,
+        pendingIdle.versionPins,
+        pendingIdle.agent.id,
+        false,
+      );
       state.drainingIdleSignalsByThread.delete(key);
       this.#notifyThreadEvents(state);
       state.startingQueuedRunIds.add(pendingIdle.runId);
       const output = await pendingIdle.agent.stream(pendingIdle.signal, {
-        ...(pendingIdle.streamOptions as any),
+        ...(pinnedStreamOptions as any),
         runId: pendingIdle.runId,
-        memory: withThreadMemory(pendingIdle.streamOptions?.memory, pendingIdle.resourceId, pendingIdle.threadId),
+        memory: withThreadMemory(pinnedStreamOptions?.memory, pendingIdle.resourceId, pendingIdle.threadId),
       });
 
       if ((idleQueue?.length ?? 0) > 0) {
@@ -4440,7 +4732,12 @@ export class AgentThreadStreamRuntime {
       wake();
     };
 
-    const createRemoteRun = (runId: string, streamId: string, streamSeq: number): AgentThreadRunRecord<any> => {
+    const createRemoteRun = (
+      runId: string,
+      streamId: string,
+      streamSeq: number,
+      versionPins?: AgentVersionPins,
+    ): AgentThreadRunRecord<any> => {
       const remoteRun = {
         parts: [] as unknown[],
         waiters: [] as Array<() => void>,
@@ -4476,6 +4773,7 @@ export class AgentThreadStreamRuntime {
         },
       });
       remoteRuns.set(streamId, remoteRun);
+      const pinnedStreamOptions = withPinnedContinuationOptions(undefined, versionPins, agent.id, false);
       return {
         agent,
         output: {
@@ -4493,7 +4791,7 @@ export class AgentThreadStreamRuntime {
         lifecycle: 'running',
         threadId: options.threadId,
         resourceId: options.resourceId,
-        streamOptions: {},
+        streamOptions: pinnedStreamOptions ?? {},
       };
     };
 
@@ -4650,6 +4948,7 @@ export class AgentThreadStreamRuntime {
           if (record) record.lifecycle = 'suspended';
         } else {
           clearActiveIfCurrent(runId, streamId);
+          state.versionPinsByRunId.delete(runId);
           remoteRun.parts.push({
             type: 'error',
             payload: { error: new AgentThreadLeaseLostError(runId) },
@@ -4778,6 +5077,8 @@ export class AgentThreadStreamRuntime {
           wake();
           return;
         }
+        const versionPins = normalizeAgentVersionPins(data.versionPins);
+        if (versionPins) state.versionPinsByRunId.set(data.runId, versionPins);
         const localRecord = state.threadRunsByStreamId.get(data.streamId);
         if (localRecord) {
           localStreamIds.add(data.streamId);
@@ -4852,7 +5153,16 @@ export class AgentThreadStreamRuntime {
         const record =
           localRecord ??
           deferredRunsByStreamId.get(data.streamId) ??
-          createRemoteRun(data.runId, data.streamId, data.streamSeq);
+          createRemoteRun(data.runId, data.streamId, data.streamSeq, versionPins);
+        if (!localRecord && versionPins) {
+          record.streamOptions =
+            withPinnedContinuationOptions(
+              record.streamOptions,
+              scopeAgentVersionPins(versionPins, agent.id),
+              agent.id,
+              false,
+            ) ?? record.streamOptions;
+        }
         if (live) {
           deferredRunsByStreamId.delete(data.streamId);
           enqueueRun(record);
@@ -4910,6 +5220,7 @@ export class AgentThreadStreamRuntime {
         stopRemoteRunLeaseWatch(eventStreamId);
         remoteRunSuspensionPrompts.delete(eventStreamId);
         clearActiveIfCurrent(data.runId, data.streamId);
+        state.versionPinsByRunId.delete(data.runId);
         if (deferredRunsByStreamId.has(eventStreamId)) {
           // Replayed failure of a run that never persisted anything — drop it.
           discardDeferredRun(eventStreamId);
@@ -4939,6 +5250,7 @@ export class AgentThreadStreamRuntime {
       }
       if (data.type === 'run-discarded') {
         discardStream(data.runId, data.streamId);
+        state.versionPinsByRunId.delete(data.runId);
         return;
       }
       if (data.type === 'run-completed' || data.type === 'run-aborted' || data.type === 'run-suspended') {
@@ -4983,6 +5295,7 @@ export class AgentThreadStreamRuntime {
           if (record) record.lifecycle = 'suspended';
         } else {
           clearActiveIfCurrent(data.runId, data.streamId);
+          state.versionPinsByRunId.delete(data.runId);
         }
         if (data.type !== 'run-suspended') {
           this.#clearSuspendedRun(state, data.runId);
@@ -5455,6 +5768,9 @@ export class AgentThreadStreamRuntime {
         resourceId,
         threadId,
         streamOptions: queuedStreamOptions,
+        versionPins: activeRecord
+          ? scopeAgentVersionPins(this.#getRunVersionPins(state, activeRecord.runId, activeRecord), agent.id)
+          : undefined,
         queueOwnerId: target.queueOwnerId,
       });
       state.pendingIdleSignalsByThread.set(key, idleQueue);
@@ -5790,7 +6106,15 @@ export class AgentThreadStreamRuntime {
       // Another run owns the thread. Queue this idle-start request and let the watcher
       // launch it only after the active run clears the thread reservation.
       const idleQueue = state.pendingIdleSignalsByThread.get(key) ?? [];
-      idleQueue.push({ agent, signal, runId, resourceId, threadId, streamOptions: target.ifIdle?.streamOptions });
+      idleQueue.push({
+        agent,
+        signal,
+        runId,
+        resourceId,
+        threadId,
+        streamOptions: target.ifIdle?.streamOptions,
+        versionPins: scopeAgentVersionPins(this.#getRunVersionPins(state, blockingRunId, blockingRecord), agent.id),
+      });
       state.pendingIdleSignalsByThread.set(key, idleQueue);
       if (activeRecord) {
         this.#watchThreadRunCompletion(state, pubsub, key, activeRecord);

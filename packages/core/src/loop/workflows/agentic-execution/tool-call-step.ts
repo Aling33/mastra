@@ -2,6 +2,7 @@ import type { ToolSet } from '@internal/ai-sdk-v5';
 import { stopGoalActivity } from '../../../agent/goal';
 import { MemoryMessageRefs } from '../../../agent/message-list/memory-message-refs';
 import { resolveDeclineReason } from '../../../agent/tool-approval';
+import { getAgentVersionPins } from '../../../agent/version-pins';
 import { executeAdoptedBackgroundOperation } from '../../../background-tasks/adoption';
 import type { BackgroundTaskProgressChunk, ToolBackgroundConfig } from '../../../background-tasks/types';
 import type { MastraDBMessage } from '../../../memory';
@@ -123,6 +124,10 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
         callerAbortSignal && options?.abortSignal
           ? AbortSignal.any([callerAbortSignal, options.abortSignal])
           : (callerAbortSignal ?? options?.abortSignal);
+      const versionPinPayload = () => {
+        const pins = getAgentVersionPins(requestContext);
+        return pins ? { __agentVersionPins: pins } : {};
+      };
       // Resolve run-scoped state from either the Mastra-managed RunScope (production
       // path via loop.ts hydration) or the legacy `_internal` bag (tests).
       const scopeCtx: RunScopeContext = { mastra, runId, _internal };
@@ -605,6 +610,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 __streamState: await serializeStreamStateForSuspend(),
                 __agentId: agentId,
                 ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
+                ...versionPinPayload(),
                 // Persist the inner suspended run id in the workflow snapshot, partitioned per
                 // tool call (resumeLabel = toolCallId). Persisted message metadata exposes the
                 // same id as delegatedRunId for cold reloads, while the snapshot remains the
@@ -651,6 +657,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 __streamState: await serializeStreamStateForSuspend(),
                 __agentId: agentId,
                 ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
+                ...versionPinPayload(),
                 toolCallId: inputData.toolCallId,
                 toolName: inputData.toolName,
                 resumeLabel: options?.resumeLabel,
@@ -723,6 +730,7 @@ export function createToolCallStep<Tools extends ToolSet = ToolSet, OUTPUT = und
                 __streamState: await serializeStreamStateForSuspend(),
                 __agentId: agentId,
                 ...(agentVersionId ? { __agentVersionId: agentVersionId } : {}),
+                ...versionPinPayload(),
               },
               {
                 resumeLabel: inputData.toolCallId,
