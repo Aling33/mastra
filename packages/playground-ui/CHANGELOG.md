@@ -1,5 +1,16 @@
 # @mastra/playground-ui
 
+## 63.0.0-alpha.3
+
+### Patch Changes
+
+- Trace Intelligence now labels its list by Agent instead of Entity. Agents whose traces are still being analyzed show an "Analyzing" status and can no longer be clicked, since they have no signals to open yet. Hovering or focusing the status shows how many traces have been collected. ([#26812](https://github.com/mastra-ai/mastra/pull/26812))
+
+- Updated dependencies [[`54e9dc3`](https://github.com/mastra-ai/mastra/commit/54e9dc3ed0615ee84a6526395a9fefe17320fe7e), [`3b6a49e`](https://github.com/mastra-ai/mastra/commit/3b6a49ea9e8de3b6bec3cf5145892ef7a47395ad)]:
+  - @mastra/core@1.77.0-alpha.3
+  - @mastra/react@1.10.0-alpha.3
+  - @mastra/client-js@1.54.0-alpha.3
+
 ## 63.0.0-alpha.2
 
 ### Minor Changes
