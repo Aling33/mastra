@@ -7,6 +7,7 @@ import { validateModelTimeoutSettings } from '../../llm/model/model-settings';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
+import { getAgentVersionSelector } from '../../mastra/types';
 import type { MastraMemory } from '../../memory/memory';
 import type { MemoryConfig, MemoryConfig as _MemoryConfig, StorageThreadType } from '../../memory/types';
 import { EntityType, SpanType, createObservabilityContext, getOrCreateSpan } from '../../observability';
@@ -58,7 +59,6 @@ import {
   exactVersionOverridesForPins,
   getAgentVersionPins,
   getResolvedAgentVersionSelection,
-  reconcileRootVersionOverrides,
   recordAgentVersionPin,
   scopeAgentVersionPins,
   setAgentVersionPinDefaultStatus,
@@ -217,6 +217,8 @@ interface DurablePreparationAgent {
   __resolveExplicitAgentVersionPins(opts: {
     requestContext: RequestContext;
     versions?: VersionOverrides;
+    preservePins?: boolean;
+    rootAgentId?: string;
   }): Promise<void>;
 }
 
@@ -252,6 +254,8 @@ export interface PreparationOptions<OUTPUT = undefined> {
   options?: AgentExecutionOptions<OUTPUT>;
   /** Whether execution options already include the agent defaults. */
   optionsAreResolved?: boolean;
+  /** Original caller selectors, before agent defaults were merged. */
+  callerVersionOverrides?: VersionOverrides;
   /** Run ID (will be generated if not provided) */
   runId?: string;
   /** Request context */
@@ -303,6 +307,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
     messages,
     options: rawExecOptions,
     optionsAreResolved = false,
+    callerVersionOverrides,
     runId: providedRunId,
     requestContext: providedRequestContext,
     logger,
@@ -376,12 +381,18 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // mirroring the non-durable Agent.stream()/generate() paths. Without this the
   // agent's configured defaults (maxSteps, providerOptions, etc.) are silently
   // dropped and durable runs fall back to DurableAgentDefaults.MAX_STEPS.
+  const defaultOptions = optionsAreResolved ? undefined : await typedAgent.getDefaultOptions({ requestContext });
   const execOptions: AgentExecutionOptions<OUTPUT> = optionsAreResolved
     ? (rawExecOptions ?? ({} as AgentExecutionOptions<OUTPUT>))
     : (deepMerge(
-        ((await typedAgent.getDefaultOptions({ requestContext })) ?? {}) as Record<string, unknown>,
+        (defaultOptions ?? {}) as Record<string, unknown>,
         (rawExecOptions ?? {}) as Record<string, unknown>,
       ) as AgentExecutionOptions<OUTPUT>);
+  if (!optionsAreResolved) {
+    // Each per-agent selector is exclusive, so replacing its kind must not
+    // recursively combine fields such as versionId and label.
+    execOptions.versions = mergeVersionOverrides(defaultOptions?.versions, rawExecOptions?.versions);
+  }
 
   validateModelTimeoutSettings(execOptions.modelSettings?.timeout);
 
@@ -395,7 +406,6 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   if ((execOptions as any)?.versions) {
     mergedVersions = mergeVersionOverrides(mergedVersions, (execOptions as any).versions);
   }
-  mergedVersions = reconcileRootVersionOverrides(mergedVersions, publicAgentId);
   if (mergedVersions) {
     requestContext.set(MASTRA_VERSIONS_KEY, mergedVersions);
   }
@@ -412,7 +422,11 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         );
       }
     }
-    assertContinuationVersionOverrides((execOptions as any)?.versions, effectiveVersionPins, publicAgentId);
+    assertContinuationVersionOverrides(
+      optionsAreResolved ? callerVersionOverrides : rawExecOptions?.versions,
+      effectiveVersionPins,
+      publicAgentId,
+    );
     assertContinuationVersionOverrides(requestVersions, effectiveVersionPins, publicAgentId);
     setAgentVersionPins(requestContext, effectiveVersionPins);
     const frozenVersions = exactVersionOverridesForPins(effectiveVersionPins);
@@ -439,11 +453,10 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
       details: { agentId: publicAgentId, resolvedVersionId: currentRootSelection.versionId },
     });
   }
-  const explicitRootSelector = mergedVersions?.self ?? mergedVersions?.agents?.[publicAgentId];
-  const rootSelector =
-    (rootPin ? { versionId: rootPin.versionId } : undefined) ??
-    explicitRootSelector ??
-    (!currentRootSelection && mergedVersions?.defaultStatus ? { status: mergedVersions.defaultStatus } : undefined);
+  const explicitRootSelector = effectiveVersionPins
+    ? undefined
+    : getAgentVersionSelector(mergedVersions, publicAgentId);
+  const rootSelector = (rootPin ? { versionId: rootPin.versionId } : undefined) ?? explicitRootSelector;
   let resolvedRootAgent = versionResolutionAgent;
   if (rootSelector && mastra) {
     try {
@@ -479,12 +492,13 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   agent = durableExecutionAgent ?? resolvedRootAgent;
   typedAgent = agent as unknown as DurablePreparationAgent;
 
-  await typedAgent.__resolveExplicitAgentVersionPins({ requestContext, versions: mergedVersions });
-  const selectedRoot = mergedVersions?.self ?? mergedVersions?.agents?.[publicAgentId];
-  setAgentVersionPinDefaultStatus(
+  await typedAgent.__resolveExplicitAgentVersionPins({
     requestContext,
-    mergedVersions?.defaultStatus ?? (selectedRoot ? ('versionId' in selectedRoot ? 'draft' : 'published') : undefined),
-  );
+    versions: mergedVersions,
+    preservePins: effectiveVersionPins !== undefined,
+    rootAgentId: publicAgentId,
+  });
+  setAgentVersionPinDefaultStatus(requestContext, mergedVersions?.defaultStatus);
 
   const selectedPins = getAgentVersionPins(requestContext);
 
@@ -747,27 +761,12 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // here is silently dropped on the worker. Framework-internal prep state
   // (memory keys, auth token, merged versions) is excluded by key inside
   // snapshotRequestContextEntries. Persist continuation-safe selectors only:
-  // root labels/statuses are historical input, and explicit dependencies keep
-  // the immutable IDs resolved before behavior began.
+  // labels/statuses are historical input; every selected agent keeps the
+  // immutable ID resolved before behavior began.
   let requestContextEntriesSnapshot = snapshotRequestContextEntries(requestContext);
   if (requestVersions !== undefined || mergedVersions) {
-    const persistedVersions: VersionOverrides = {
-      ...(selectedPins?.defaultStatus
-        ? { defaultStatus: selectedPins.defaultStatus }
-        : selectedRoot
-          ? { defaultStatus: 'versionId' in selectedRoot ? 'draft' : 'published' }
-          : selectedPins?.root?.selectedLabel
-            ? { defaultStatus: 'published' }
-            : {}),
-      ...(selectedPins?.agents
-        ? {
-            agents: Object.fromEntries(
-              Object.entries(selectedPins.agents).map(([agentId, pin]) => [agentId, { versionId: pin.versionId }]),
-            ),
-          }
-        : {}),
-    };
-    if (Object.keys(persistedVersions).length > 0) {
+    const persistedVersions = exactVersionOverridesForPins(selectedPins);
+    if (persistedVersions) {
       requestContextEntriesSnapshot ??= {};
       requestContextEntriesSnapshot[MASTRA_VERSIONS_KEY] = persistedVersions;
     }
