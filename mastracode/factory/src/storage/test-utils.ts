@@ -7,14 +7,16 @@
 import { LibSQLFactoryStorage } from '@mastra/libsql';
 import { onTestFinished } from 'vitest';
 
+import { createBoardRegistry, workItemPhaseSemantics } from '../boards/index.js';
 import { AuditStorage } from './domains/audit/base.js';
 import { ChannelIdentityStorage } from './domains/channel-identity/base.js';
+import { WorkItemCommentsStorage } from './domains/comments/base.js';
 import { ModelCredentialsStorage } from './domains/credentials/base.js';
 import { CustomProvidersStorage } from './domains/custom-providers/base.js';
 import { IntakeStorage } from './domains/intake/base.js';
 import { IntegrationStorage } from './domains/integrations/base.js';
 import { MemorySettingsStorage } from './domains/memory-settings/base.js';
-import { ModelPacksStorage } from './domains/model-packs/base.js';
+import { ModelDefaultsStorage } from './domains/model-defaults/base.js';
 import { FactoryProjectsStorage } from './domains/projects/base.js';
 import { QueueHealthStorage } from './domains/queue-health/base.js';
 import { SourceControlStorage } from './domains/source-control/base.js';
@@ -29,11 +31,12 @@ export interface FactoryStorageTestSeed {
   integrations: IntegrationStorage;
   projects: FactoryProjectsStorage;
   sourceControl: SourceControlStorage;
-  modelPacks: ModelPacksStorage;
+  modelDefaults: ModelDefaultsStorage;
   memorySettings: MemorySettingsStorage;
   customProviders: CustomProvidersStorage;
   queueHealth: QueueHealthStorage;
   channelIdentity: ChannelIdentityStorage;
+  comments: WorkItemCommentsStorage;
 }
 
 /**
@@ -46,15 +49,18 @@ export async function createFactoryStorageForTests(): Promise<FactoryStorageTest
   const intake = storage.registerDomain(new IntakeStorage());
   const audit = storage.registerDomain(new AuditStorage());
   const workItems = storage.registerDomain(new WorkItemsStorage());
+  const boards = createBoardRegistry();
+  workItems.useTerminalPhasePredicate(item => workItemPhaseSemantics(boards, item)?.kind === 'terminal');
   const credentials = storage.registerDomain(new ModelCredentialsStorage());
   const integrations = storage.registerDomain(new IntegrationStorage());
   const projects = storage.registerDomain(new FactoryProjectsStorage());
   const sourceControl = storage.registerDomain(new SourceControlStorage());
-  const modelPacks = storage.registerDomain(new ModelPacksStorage());
+  const modelDefaults = storage.registerDomain(new ModelDefaultsStorage());
   const memorySettings = storage.registerDomain(new MemorySettingsStorage());
   const customProviders = storage.registerDomain(new CustomProvidersStorage());
   const queueHealth = storage.registerDomain(new QueueHealthStorage());
   const channelIdentity = storage.registerDomain(new ChannelIdentityStorage());
+  const comments = storage.registerDomain(new WorkItemCommentsStorage());
   await storage.init();
   onTestFinished(() => storage.close());
   return {
@@ -66,10 +72,11 @@ export async function createFactoryStorageForTests(): Promise<FactoryStorageTest
     integrations,
     projects,
     sourceControl,
-    modelPacks,
+    modelDefaults,
     memorySettings,
     customProviders,
     queueHealth,
     channelIdentity,
+    comments,
   };
 }

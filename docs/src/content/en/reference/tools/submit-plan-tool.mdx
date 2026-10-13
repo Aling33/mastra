@@ -1,6 +1,6 @@
 ---
 title: "Reference: submitPlanTool | Tools"
-description: "API reference for submitPlanTool, a built-in tool that suspends an agent run to submit a plan file for user approval."
+description: "A built-in, agent-agnostic tool that submits an implementation plan for user review. The agent writes a plan to a markdown file and passes the file path to this tool."
 packages:
   - "@mastra/core"
 ---
@@ -80,6 +80,11 @@ The `tool-call-suspended` event carries a `suspendPayload`:
 
 <PropertiesTable
   content={[
+  {
+    name: 'toolId',
+    type: "'submit_plan'",
+    description: 'ID of the tool that suspended the run.',
+  },
   {
     name: 'path',
     type: 'string',

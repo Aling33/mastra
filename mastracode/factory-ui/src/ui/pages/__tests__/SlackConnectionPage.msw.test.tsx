@@ -1,4 +1,4 @@
-import { MainSidebarProvider } from '@mastra/playground-ui/components/MainSidebar';
+import { SidebarProvider } from '@mastra/playground-ui/components/Sidebar';
 import userEvent from '@testing-library/user-event';
 import { screen, waitFor, within } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
@@ -42,13 +42,13 @@ function renderPage(slackWorkItemsEnabled = false) {
   mockFactories(slackWorkItemsEnabled);
   return renderWithProviders(
     <MemoryRouter initialEntries={['/factories/fp-1/settings/connections/slack']}>
-      <MainSidebarProvider storageKey="slack-connection-page-test" mobileBreakpoint={0}>
+      <SidebarProvider storageKey="slack-connection-page-test" mobileBreakpoint={0}>
         <OverlaysProvider>
           <Routes>
             <Route path="/factories/:factoryId/settings/connections/slack" element={<SlackConnectionPage />} />
           </Routes>
         </OverlaysProvider>
-      </MainSidebarProvider>
+      </SidebarProvider>
     </MemoryRouter>,
   );
 }
@@ -104,7 +104,10 @@ describe('SlackConnectionPage', () => {
     expect(await screen.findByText('Slack user ID: U00000001')).toBeInTheDocument();
 
     expect(within(connectionSection).queryByText('Connected account')).not.toBeInTheDocument();
-    expect(within(connectionSection).getByText(/Connected January 15, 2026/)).toBeInTheDocument();
+    const linkedAt = new Intl.DateTimeFormat(undefined, { dateStyle: 'long', timeStyle: 'short' }).format(
+      new Date(slackLink.linkedAt),
+    );
+    expect(within(connectionSection).getByText(`Connected ${linkedAt}`)).toBeInTheDocument();
     expect(screen.getByText('Start and continue Factory sessions from Slack.')).toBeInTheDocument();
 
     const sessionBehaviorSection = screen
@@ -114,8 +117,16 @@ describe('SlackConnectionPage', () => {
     expect(
       within(sessionBehaviorSection).getByRole('combobox', { name: 'Default factory for Test User' }),
     ).toHaveTextContent('Primary Factory');
+
+    // Routing a Slack account is personal; creating work items flips a flag on
+    // the factory, so it sits in its own block rather than under this one.
     expect(
-      within(sessionBehaviorSection).getByRole('switch', { name: 'Create work items for new Slack threads' }),
+      within(sessionBehaviorSection).queryByRole('switch', { name: 'Create work items for new Slack threads' }),
+    ).not.toBeInTheDocument();
+    const workItemsSection = screen.getByRole('heading', { level: 2, name: 'Work items' }).closest('section');
+    if (!workItemsSection) throw new Error('Work items section not found');
+    expect(
+      within(workItemsSection).getByRole('switch', { name: 'Create work items for new Slack threads' }),
     ).toBeInTheDocument();
 
     const dangerZoneSection = screen.getByRole('heading', { level: 2, name: 'Danger zone' }).closest('section');
@@ -128,6 +139,7 @@ describe('SlackConnectionPage', () => {
     expect(screen.getAllByRole('heading', { level: 2 }).map(heading => heading.textContent)).toEqual([
       'Connection',
       'Session behavior',
+      'Work items',
       'Danger zone',
     ]);
   });

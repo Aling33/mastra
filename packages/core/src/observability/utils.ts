@@ -7,7 +7,7 @@
  */
 
 import { EntityType, SpanType } from './types';
-import type { Span, GetOrCreateSpanOptions, AnySpan } from './types';
+import type { Span, GetOrCreateSpanOptions, AnySpan, TracingOptions, TracingProperties } from './types';
 
 const entityTypeValues = new Set<EntityType>(Object.values(EntityType));
 let currentSpanResolver: (() => AnySpan | undefined) | undefined;
@@ -35,6 +35,10 @@ export function generateSignalId(): string {
  * array means "no tools enabled for this step" and is honored as such.
  * Returns `[]` (not `undefined`) when `tools` is provided but empty, so a
  * tool-less agent still reports a definitive empty list to observers.
+ *
+ * @deprecated No longer used. `availableTools` is now derived from the tool
+ * definitions serialized for the MODEL_INFERENCE `tools` attribute, which
+ * also apply `toolChoice` and drop names that are not registered tools.
  */
 export function getStepAvailableToolNames(
   tools?: Record<string, unknown> | undefined,
@@ -99,6 +103,29 @@ export function executeWithContextSync<T>(params: { span?: AnySpan; fn: () => T 
 }
 
 /**
+ * Resolve the spanId an observability signal should reference for a span.
+ *
+ * Signals (logs, metrics, and a suspending run's resume link) must name a span
+ * that actually reached exporters. An internal or excluded span is never
+ * stored, so referencing its raw id leaves the signal pointing at nothing:
+ * log/metric span lookups 404, and a resumed run's exported children inherit a
+ * dangling parentSpanId and land as orphans. `undefined` is a valid answer — it
+ * omits the reference rather than pointing it at a span that does not exist.
+ *
+ * `getExportedSpanId` is optional on the `Span` interface, so the typeof guard
+ * separates "this implementation predates the method" (keep the old behavior of
+ * referencing the span's own id) from "the method ran and found nothing
+ * exportable" (undefined). Without it the two collapse and custom span
+ * implementations silently lose correlation.
+ */
+export function resolveExportedSpanId(
+  span: { id?: string; getExportedSpanId?: () => string | undefined } | undefined | null,
+): string | undefined {
+  if (!span) return undefined;
+  return typeof span.getExportedSpanId === 'function' ? span.getExportedSpanId() : span.id;
+}
+
+/**
  * Creates or gets a child span from existing tracing context or starts a new trace.
  * This helper consolidates the common pattern of creating spans that can either be:
  * 1. Children of an existing span (when tracingContext.currentSpan exists)
@@ -110,9 +137,11 @@ export function executeWithContextSync<T>(params: { span?: AnySpan; fn: () => T 
 export function getOrCreateSpan<T extends SpanType>(options: GetOrCreateSpanOptions<T>): Span<T> | undefined {
   const { type, attributes, tracingContext, requestContext, tracingOptions, resumedFromSpanId, ...rest } = options;
 
+  // tracingOptions.metadata takes precedence, but a key it merely names with
+  // an `undefined` value must not erase the span's own metadata value.
   const metadata = {
     ...(rest.metadata ?? {}),
-    ...(tracingOptions?.metadata ?? {}),
+    ...Object.fromEntries(Object.entries(tracingOptions?.metadata ?? {}).filter(([, value]) => value !== undefined)),
   };
 
   // If we have a current span, create a child span
@@ -147,6 +176,19 @@ export function getOrCreateSpan<T extends SpanType>(options: GetOrCreateSpanOpti
       metadata,
     },
   });
+}
+
+/**
+ * Builds `tracingOptions` that attach the next run as a child of a previous
+ * run, for example an LLM judge under the run it scores. Pass the previous
+ * run's result (or its `traceId` and `spanId`). When that run was not traced,
+ * the given options are returned unchanged.
+ */
+export function nestUnderRun(run: TracingProperties, tracingOptions?: TracingOptions): TracingOptions | undefined {
+  if (!run.traceId || !run.spanId) {
+    return tracingOptions;
+  }
+  return { ...tracingOptions, traceId: run.traceId, parentSpanId: run.spanId, nestUnderParent: true };
 }
 
 /**
@@ -204,6 +246,8 @@ export function getEntityTypeForSpan(span: {
     case SpanType.MCP_TOOL_CALL:
     case SpanType.PROVIDER_TOOL_CALL:
       return EntityType.TOOL;
+    case SpanType.MCP_SERVER_REQUEST:
+      return EntityType.MCP_SERVER;
     case SpanType.PROCESSOR_RUN:
       return EntityType.OUTPUT_PROCESSOR;
     default:

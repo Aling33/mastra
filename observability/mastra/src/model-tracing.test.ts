@@ -2,9 +2,10 @@ import { ReadableStream } from 'node:stream/web';
 import { coreFeatures } from '@mastra/core/features';
 import type { ObservabilityExporter, TracingEvent, ExportedSpan, MetricEvent } from '@mastra/core/observability';
 import { SpanType, SamplingStrategyType, TracingEventType } from '@mastra/core/observability';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { DefaultObservabilityInstance } from './instances';
+import { PricingRegistry } from './metrics/pricing-registry';
 import { ModelSpanTracker } from './model-tracing';
 
 /**
@@ -87,6 +88,97 @@ describe('ModelSpanTracker', () => {
       name: 'test-instance',
       sampling: { type: SamplingStrategyType.ALWAYS },
       exporters: [testExporter],
+    });
+  });
+
+  describe('provider-reported costs', () => {
+    it('sums a BYOK upstream cost across steps, even when the OpenRouter surcharge is zero', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+        attributes: { model: 'openai/gpt-5-nano', provider: 'openrouter' },
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.endGeneration({
+        attributes: {},
+        stepProviderMetadata: [
+          {
+            openrouter: {
+              usage: { cost: 0, isByok: true, costDetails: { upstreamInferenceCost: 0.00002615 } },
+            },
+          },
+          { openrouter: { usage: { cost: 0.000001, isByok: false } } },
+        ],
+      });
+
+      const [span] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(span?.attributes?.costContext).toEqual({
+        provider: 'openrouter',
+        model: 'openai/gpt-5-nano',
+        estimatedCost: 0.00002715,
+        costUnit: 'USD',
+        costMetadata: {
+          source: 'provider_reported',
+          sdkProvider: 'openrouter',
+          sdkCostField: 'openrouter.usage.cost+openrouter.usage.costDetails.upstreamInferenceCost',
+          scope: 'query_total',
+          reportedStepCount: 2,
+        },
+      });
+    });
+
+    it('uses the exact cost from the shape published provider versions emit, without isByok', () => {
+      // Matches the recorded OpenRouter response for a non-BYOK request: cost and
+      // upstreamInferenceCost are equal and the provider drops usage.is_byok.
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+        attributes: { model: 'openai/gpt-4o-mini', provider: 'openrouter' },
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.endGeneration({
+        attributes: {},
+        providerMetadata: {
+          openrouter: { usage: { cost: 0.0000084, costDetails: { upstreamInferenceCost: 0.0000084 } } },
+        },
+      });
+
+      const [span] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(span?.attributes?.costContext?.estimatedCost).toBe(0.0000084);
+      expect(span?.attributes?.costContext?.costMetadata).toMatchObject({
+        source: 'provider_reported',
+        sdkCostField: 'openrouter.usage.cost',
+      });
+    });
+
+    it('does not double-count the non-BYOK upstream cost breakdown', () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+        attributes: { model: 'openai/gpt-4o-mini', provider: 'openrouter' },
+      });
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      tracker.endGeneration({
+        attributes: {},
+        providerMetadata: {
+          openrouter: {
+            usage: {
+              cost: 0.000003,
+              isByok: false,
+              costDetails: { upstreamInferenceCost: 0.000003 },
+            },
+          },
+        },
+      });
+
+      const [span] = testExporter.getSpansByType(SpanType.MODEL_GENERATION);
+      expect(span?.attributes?.costContext?.estimatedCost).toBe(0.000003);
+      expect(span?.attributes?.costContext?.costMetadata).toMatchObject({
+        sdkCostField: 'openrouter.usage.cost',
+      });
     });
   });
 
@@ -1413,6 +1505,46 @@ describe('ModelSpanTracker', () => {
     });
   });
 
+  describe('step metadata cleanup', () => {
+    it('should strip the raw provider response body but keep response headers', async () => {
+      const modelSpan = tracing.startSpan({
+        type: SpanType.MODEL_GENERATION,
+        name: 'test-generation',
+      });
+
+      const tracker = new ModelSpanTracker(modelSpan);
+
+      const headers = { 'x-request-id': 'req_1', 'x-ratelimit-remaining-tokens': '1000' };
+      const chunks = [
+        { type: 'step-start', payload: { messageId: 'msg-1', request: {} } },
+        {
+          type: 'step-finish',
+          payload: {
+            output: {},
+            stepResult: { reason: 'stop' },
+            metadata: {
+              modelMetadata: { modelId: 'gpt-4o-mini', modelProvider: 'openai' },
+              request: { body: '{}' },
+              body: { id: 'resp_1', output: [{ type: 'message', content: 'x'.repeat(1000) }] },
+              headers,
+            },
+          },
+        },
+      ];
+
+      await consumeStream(tracker.wrapStream(createMockStream(chunks)));
+      modelSpan.end();
+
+      const stepSpans = testExporter.getSpansByType(SpanType.MODEL_STEP);
+      expect(stepSpans).toHaveLength(1);
+      const metadata = stepSpans[0]!.metadata as Record<string, unknown>;
+      expect(metadata).not.toHaveProperty('body');
+      expect(metadata).not.toHaveProperty('request');
+      expect(metadata.headers).toEqual(headers);
+      expect(metadata.modelMetadata).toEqual({ modelId: 'gpt-4o-mini', modelProvider: 'openai' });
+    });
+  });
+
   describe('tool-result preview in step input', () => {
     it('should show transformed tool-result providerOptions from final inputMessages', async () => {
       const modelSpan = tracing.startSpan({
@@ -1849,7 +1981,7 @@ describe('ModelSpanTracker', () => {
       modelSpan.end();
     });
 
-    it('applies inference context (parameters / providerOptions / availableTools / toolChoice / responseFormat) set via setInferenceContext', async () => {
+    it('applies inference context (parameters / providerOptions / availableTools / tools / toolChoice / responseFormat) set via setInferenceContext', async () => {
       const modelSpan = tracing.startSpan({
         type: SpanType.MODEL_GENERATION,
         name: 'test-generation',
@@ -1861,6 +1993,7 @@ describe('ModelSpanTracker', () => {
         parameters: { temperature: 0.7, maxOutputTokens: 1024 },
         providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } },
         availableTools: ['weather', 'calculator'],
+        tools: [{ type: 'function', name: 'weather', description: 'Get weather', parameters: { type: 'object' } }],
         toolChoice: 'auto',
         responseFormat: 'json_schema',
       });
@@ -1887,6 +2020,7 @@ describe('ModelSpanTracker', () => {
         parameters: { temperature: 0.7, maxOutputTokens: 1024 },
         providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } },
         availableTools: ['weather', 'calculator'],
+        tools: [{ type: 'function', name: 'weather', description: 'Get weather', parameters: { type: 'object' } }],
         toolChoice: 'auto',
         responseFormat: 'json_schema',
       });
@@ -2142,6 +2276,12 @@ describe('ModelSpanTracker', () => {
       });
 
       it('falls back to pricing estimates when the aggregate Gateway cost is non-finite', () => {
+        onTestFinished(() => vi.restoreAllMocks());
+        vi.spyOn(PricingRegistry, 'getGlobal').mockReturnValue(
+          PricingRegistry.fromModelsDev({
+            vercel: { models: { 'claude-haiku-4-5': { cost: { input: 1, output: 5 } } } },
+          }),
+        );
         const span = endGeneration({
           attributes: { model: 'anthropic/claude-haiku-4.5', provider: 'gateway' },
           usage: { inputTokens: 100, outputTokens: 50 },

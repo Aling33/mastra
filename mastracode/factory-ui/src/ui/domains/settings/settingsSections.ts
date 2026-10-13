@@ -6,19 +6,23 @@ export type SettingsSection =
   | 'repositories'
   | 'intake'
   | 'models'
+  | 'personal-models'
   | 'memory'
+  | 'factory-memory'
   | 'skills'
   | 'behavior';
 
 export const SETTINGS_SECTION_LABELS: Record<SettingsSection, string> = {
   account: 'My account',
   preferences: 'Preferences',
-  factory: 'Factory',
+  factory: 'Manage Factory',
   connections: 'Connections',
   repositories: 'Repositories',
   intake: 'Work Intake',
-  models: 'Models',
-  memory: 'Memory',
+  models: 'Factory models',
+  'personal-models': 'Your models',
+  memory: 'Your memory',
+  'factory-memory': 'Factory memory',
   skills: 'Skills',
   behavior: 'Behavior',
 };

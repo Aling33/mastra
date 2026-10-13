@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import fastq from 'fastq';
 import type { done as DoneCallback } from 'fastq';
 import type { ActorSignal } from '../../auth/ee';
@@ -9,7 +8,7 @@ import { SpanType, createObservabilityContext, resolveObservabilityContext } fro
 import type { ObservabilityContext } from '../../observability';
 import { ToolStream } from '../../tools/stream';
 import { selectFields } from '../../utils';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
+import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, WORKFLOW_CANCELLED_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import type { ConditionFunction, InnerOutput, LoopConditionFunction } from '../step';
 import { getStepResult } from '../step';
@@ -31,6 +30,7 @@ import type {
 } from '../types';
 import {
   createDeprecationProxy,
+  defineLazyWriter,
   runCountDeprecationMessage,
   getResumeLabelsByStepId,
   getSingleStepEntryId,
@@ -45,6 +45,42 @@ function publishStepEvent(
   ...args: Parameters<PubSub['publish']>
 ): Promise<void> {
   return engine.options.emitStepEvents === false ? Promise.resolve() : pubsub.publish(...args);
+}
+
+/**
+ * Builds the display name for a control-flow container span. When the graph
+ * entry carries an authored `id`, it is used so observability tools can
+ * identify the specific operation (e.g. `parallel: 'check-document'`).
+ * Otherwise the generic structural name is used as a fallback.
+ */
+export function getControlFlowSpanName(entry: { id?: string }, fallbackName: string): string {
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  return id ? `${fallbackName.split(':')[0]}: '${id}'` : fallbackName;
+}
+
+/**
+ * Exposes the authored entry identity and metadata on container span
+ * attributes so processors and exporters can identify the operation without
+ * relying on structural matching. Only includes fields that are present.
+ */
+export function getControlFlowIdentityAttributes(entry: {
+  id?: string;
+  description?: string;
+  metadata?: Record<string, any>;
+}): Record<string, any> {
+  const attributes: Record<string, any> = {};
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  if (id) {
+    attributes.entryId = id;
+  }
+  const description = typeof entry.description === 'string' ? entry.description.trim() : '';
+  if (description) {
+    attributes.entryDescription = description;
+  }
+  if (entry.metadata && typeof entry.metadata === 'object') {
+    attributes.entryMetadata = entry.metadata;
+  }
+  return attributes;
 }
 
 /**
@@ -64,6 +100,8 @@ function executeChildEntry(
       return engine.executeAgent({ ...params, entry: child });
     case 'tool':
       return engine.executeTool({ ...params, entry: child });
+    case 'classifier':
+      return engine.executeClassifier({ ...params, entry: child });
     case 'mapping':
       return engine.executeMapping({ ...params, entry: child });
   }
@@ -75,6 +113,9 @@ export interface ExecuteParallelParams extends ObservabilityContext {
   resourceId?: string;
   entry: {
     type: 'parallel';
+    id?: string;
+    description?: string;
+    metadata?: Record<string, any>;
     steps: SingleStepEntry[];
   };
   serializedStepGraph: SerializedStepFlowEntry[];
@@ -133,11 +174,12 @@ export async function executeParallel(
     operationId: `workflow.${workflowId}.run.${runId}.parallel.${executionContext.executionPath.join('-')}.span.start`,
     options: {
       type: SpanType.WORKFLOW_PARALLEL,
-      name: `parallel: '${steps.length} branches'`,
+      name: getControlFlowSpanName(entry, `parallel: '${steps.length} branches'`),
       input: engine.getStepOutput(stepResults, prevStep),
       attributes: {
         branchCount: steps.length,
         parallelSteps: steps.map(s => getSingleStepEntryId(s)),
+        ...getControlFlowIdentityAttributes(entry),
       },
       tracingPolicy: engine.options?.tracingPolicy,
     },
@@ -279,6 +321,9 @@ export interface ExecuteConditionalParams extends ObservabilityContext {
   serializedStepGraph: SerializedStepFlowEntry[];
   entry: {
     type: 'conditional';
+    id?: string;
+    description?: string;
+    metadata?: Record<string, any>;
     steps: SingleStepEntry[];
     conditions: ConditionFunction<any, any, any, any, any, DefaultEngineType>[];
   };
@@ -337,10 +382,11 @@ export async function executeConditional(
     operationId: `workflow.${workflowId}.run.${runId}.conditional.${executionContext.executionPath.join('-')}.span.start`,
     options: {
       type: SpanType.WORKFLOW_CONDITIONAL,
-      name: `conditional: '${entry.conditions.length} conditions'`,
+      name: getControlFlowSpanName(entry, `conditional: '${entry.conditions.length} conditions'`),
       input: prevOutput,
       attributes: {
         conditionCount: entry.conditions.length,
+        ...getControlFlowIdentityAttributes(entry),
       },
       tracingPolicy: engine.options?.tracingPolicy,
     },
@@ -367,37 +413,41 @@ export async function executeConditional(
         });
 
         const operationId = `workflow.${workflowId}.conditional.${index}`;
+        const conditionCallId = globalThis.crypto.randomUUID();
         const context = createDeprecationProxy(
-          {
-            runId,
-            workflowId,
-            mastra: engine.mastra!,
-            requestContext,
-            actor,
-            inputData: prevOutput,
-            state: executionContext.state,
-            retryCount: -1,
-            ...createObservabilityContext({ currentSpan: evalSpan }),
-            getInitData: () => stepResults?.input as any,
-            getStepResult: getStepResult.bind(null, stepResults),
-            bail: (() => {}) as () => InnerOutput,
-            abort: () => {
-              abortController?.abort();
-            },
-            [PUBSUB_SYMBOL]: pubsub,
-            [STREAM_FORMAT_SYMBOL]: executionContext.format,
-            engine: engine.getEngineContext(),
-            abortSignal: abortController?.signal,
-            writer: new ToolStream(
-              {
-                prefix: 'workflow-step',
-                callId: randomUUID(),
-                name: 'conditional',
-                runId,
+          defineLazyWriter(
+            {
+              runId,
+              workflowId,
+              mastra: engine.mastra!,
+              requestContext,
+              actor,
+              inputData: prevOutput,
+              state: executionContext.state,
+              retryCount: -1,
+              ...createObservabilityContext({ currentSpan: evalSpan }),
+              getInitData: () => stepResults?.input as any,
+              getStepResult: getStepResult.bind(null, stepResults),
+              bail: (() => {}) as () => InnerOutput,
+              abort: () => {
+                abortController?.abort(WORKFLOW_CANCELLED_SYMBOL);
               },
-              outputWriter,
-            ),
-          },
+              [PUBSUB_SYMBOL]: pubsub,
+              [STREAM_FORMAT_SYMBOL]: executionContext.format,
+              engine: engine.getEngineContext(),
+              abortSignal: abortController?.signal,
+            },
+            () =>
+              new ToolStream(
+                {
+                  prefix: 'workflow-step',
+                  callId: conditionCallId,
+                  name: 'conditional',
+                  runId,
+                },
+                outputWriter,
+              ),
+          ),
           {
             paramName: 'runCount',
             deprecationMessage: runCountDeprecationMessage,
@@ -603,6 +653,9 @@ export interface ExecuteLoopParams extends ObservabilityContext {
   resourceId?: string;
   entry: {
     type: 'loop';
+    id?: string;
+    description?: string;
+    metadata?: Record<string, any>;
     step: SingleStepEntry;
     condition: LoopConditionFunction<any, any, any, any, any, DefaultEngineType>;
     loopType: 'dowhile' | 'dountil';
@@ -665,10 +718,11 @@ export async function executeLoop(
     operationId: `workflow.${workflowId}.run.${runId}.loop.${executionContext.executionPath.join('-')}.span.start`,
     options: {
       type: SpanType.WORKFLOW_LOOP,
-      name: `loop: '${entry.loopType}'`,
+      name: getControlFlowSpanName(entry, `loop: '${entry.loopType}'`),
       input: prevOutput,
       attributes: {
         loopType: entry.loopType,
+        ...getControlFlowIdentityAttributes(entry),
       },
       tracingPolicy: engine.options?.tracingPolicy,
     },
@@ -701,7 +755,7 @@ export async function executeLoop(
           },
         },
       });
-      return { status: 'canceled' } as unknown as StepResult<any, any, any, any>;
+      return { status: 'canceled' };
     }
 
     const stepExecResult = await executeChildEntry(engine, step, {
@@ -766,7 +820,7 @@ export async function executeLoop(
           },
         },
       });
-      return { status: 'canceled' } as unknown as StepResult<any, any, any, any>;
+      return { status: 'canceled' };
     }
 
     const evalSpan = await engine.createChildSpan({
@@ -784,39 +838,43 @@ export async function executeLoop(
       executionContext,
     });
 
+    const loopCallId = globalThis.crypto.randomUUID();
     isTrue = await condition(
       createDeprecationProxy(
-        {
-          workflowId,
-          runId,
-          mastra: engine.mastra!,
-          requestContext,
-          actor,
-          inputData: result.output,
-          state: executionContext.state,
-          retryCount: -1,
-          ...createObservabilityContext({ currentSpan: evalSpan }),
-          iterationCount: iteration + 1,
-          getInitData: () => stepResults?.input as any,
-          getStepResult: getStepResult.bind(null, stepResults),
-          bail: (() => {}) as () => InnerOutput,
-          abort: () => {
-            abortController?.abort();
-          },
-          [PUBSUB_SYMBOL]: pubsub,
-          [STREAM_FORMAT_SYMBOL]: executionContext.format,
-          engine: engine.getEngineContext(),
-          abortSignal: abortController?.signal,
-          writer: new ToolStream(
-            {
-              prefix: 'workflow-step',
-              callId: randomUUID(),
-              name: 'loop',
-              runId,
+        defineLazyWriter(
+          {
+            workflowId,
+            runId,
+            mastra: engine.mastra!,
+            requestContext,
+            actor,
+            inputData: result.output,
+            state: executionContext.state,
+            retryCount: -1,
+            ...createObservabilityContext({ currentSpan: evalSpan }),
+            iterationCount: iteration + 1,
+            getInitData: () => stepResults?.input as any,
+            getStepResult: getStepResult.bind(null, stepResults),
+            bail: (() => {}) as () => InnerOutput,
+            abort: () => {
+              abortController?.abort(WORKFLOW_CANCELLED_SYMBOL);
             },
-            outputWriter,
-          ),
-        },
+            [PUBSUB_SYMBOL]: pubsub,
+            [STREAM_FORMAT_SYMBOL]: executionContext.format,
+            engine: engine.getEngineContext(),
+            abortSignal: abortController?.signal,
+          },
+          () =>
+            new ToolStream(
+              {
+                prefix: 'workflow-step',
+                callId: loopCallId,
+                name: 'loop',
+                runId,
+              },
+              outputWriter,
+            ),
+        ),
         {
           paramName: 'runCount',
           deprecationMessage: runCountDeprecationMessage,
@@ -848,7 +906,7 @@ export async function executeLoop(
           },
         },
       });
-      return { status: 'canceled' } as unknown as StepResult<any, any, any, any>;
+      return { status: 'canceled' };
     }
   } while (entry.loopType === 'dowhile' ? isTrue : !isTrue);
 
@@ -872,6 +930,9 @@ export interface ExecuteForeachParams extends ObservabilityContext {
   resourceId?: string;
   entry: {
     type: 'foreach';
+    id?: string;
+    description?: string;
+    metadata?: Record<string, any>;
     step: SingleStepEntry;
     opts: ForeachOptions;
   };
@@ -949,11 +1010,12 @@ export async function executeForeach(
     operationId: `workflow.${workflowId}.run.${runId}.foreach.${executionContext.executionPath.join('-')}.span.start`,
     options: {
       type: SpanType.WORKFLOW_LOOP,
-      name: `loop: 'foreach'`,
+      name: getControlFlowSpanName(entry, `loop: 'foreach'`),
       input: prevOutput,
       attributes: {
         loopType: 'foreach',
         concurrency,
+        ...getControlFlowIdentityAttributes(entry),
       },
       tracingPolicy: engine.options?.tracingPolicy,
     },
@@ -991,6 +1053,7 @@ export async function executeForeach(
 
   const prevForeachOutput = (prevPayload?.suspendPayload?.__workflow_meta?.foreachOutput ||
     []) as PersistedForeachStepResult[];
+  const nestedRunIds: string[] = [];
   const prevResumeLabels = prevPayload?.suspendPayload?.__workflow_meta?.resumeLabels || {};
   const resumeLabels = getResumeLabelsByStepId(prevResumeLabels, stepId);
 
@@ -1111,7 +1174,7 @@ export async function executeForeach(
             status: 'canceled',
             output: results,
             endedAt: Date.now(),
-          } as unknown as StepResult<any, any, any, any>;
+          };
         }
         killQueue();
         inFlight--;
@@ -1136,6 +1199,9 @@ export async function executeForeach(
       if (result.status === 'success' && result.output !== undefined) {
         results[k] = result.output;
       }
+      if (typeof result.metadata?.nestedRunId === 'string') {
+        nestedRunIds[k] = result.metadata.nestedRunId;
+      }
 
       // Preserve `suspendPayload` for iterations that are still suspended so
       // their resume context (e.g. an agent's `__streamState`) survives the
@@ -1143,16 +1209,21 @@ export async function executeForeach(
       // clear it to keep the snapshot small.
       prevForeachOutput[k] = result.status === 'suspended' ? result : { ...result, suspendPayload: {} };
     } catch (err) {
+      const errorObj = err instanceof Error ? err : new Error(String(err));
+      const thrownResult: PersistedForeachStepResult = {
+        status: 'failed',
+        error: errorObj,
+        payload: undefined,
+        startedAt: Date.now(),
+        endedAt: Date.now(),
+      };
       if (!errorResult) {
-        const errorObj = err instanceof Error ? err : new Error(String(err));
-        errorResult = {
-          status: 'failed',
-          error: errorObj,
-          payload: undefined,
-          startedAt: Date.now(),
-          endedAt: Date.now(),
-        };
+        errorResult = thrownResult as StepFailure<any, any, any, any>;
       }
+      // Record the iteration that threw so the failure result below reports it
+      // as failed (and therefore retried) rather than leaving a hole in the
+      // per-iteration progress array.
+      prevForeachOutput[k] = thrownResult;
       killQueue();
     }
 
@@ -1187,6 +1258,9 @@ export async function executeForeach(
 
       if (prevItemResult.status === 'success' && prevItemResult.output !== undefined) {
         results[k] = prevItemResult.output;
+      }
+      if (typeof prevItemResult.metadata?.nestedRunId === 'string') {
+        nestedRunIds[k] = prevItemResult.metadata.nestedRunId;
       }
       // Preserve suspendPayload for still-suspended items (same as worker logic)
       prevForeachOutput[k] =
@@ -1239,12 +1313,7 @@ export async function executeForeach(
         output: results,
       },
     });
-    return { ...stepInfo, status: 'canceled', output: results, endedAt: Date.now() } as unknown as StepResult<
-      any,
-      any,
-      any,
-      any
-    >;
+    return { ...stepInfo, status: 'canceled', output: results, endedAt: Date.now() };
   }
 
   // Handle error result first (matches previous behavior of returning on first error)
@@ -1288,7 +1357,22 @@ export async function executeForeach(
       },
     });
 
-    return finalErrorResult;
+    // Persist the per-iteration progress accumulated before the failure, using
+    // the same `__workflow_meta.foreachOutput` channel the suspend path below
+    // uses. Re-entering this foreach (via time travel, or any other path that
+    // replays the step) then skips the iterations that already succeeded
+    // instead of running their side effects a second time. See issue #21749.
+    return {
+      ...finalErrorResult,
+      suspendPayload: {
+        ...finalErrorResult.suspendPayload,
+        __workflow_meta: {
+          ...(finalErrorResult.suspendPayload as any)?.__workflow_meta,
+          foreachOutput: prevForeachOutput,
+          resumeLabels: executionContext.resumeLabels,
+        },
+      },
+    } as StepFailure<any, any, any, any>;
   }
 
   if (exitResult) {
@@ -1410,6 +1494,7 @@ export async function executeForeach(
     ...stepInfo,
     status: 'success',
     output: results,
+    ...(nestedRunIds.length > 0 ? { metadata: { nestedRunId: nestedRunIds } } : {}),
     endedAt: Date.now(),
   } as StepSuccess<any, any, any, any>;
 }

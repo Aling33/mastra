@@ -1,17 +1,11 @@
 ---
 title: "Subagents | File-based Agents"
-description: Declare specialist child agents for a file-based agent under subagents/.
+description: "A file-based agent can declare subagents, specialist child agents it delegates to."
 packages:
   - "@mastra/core"
 ---
 
 # Subagents
-
-:::beta
-
-Breaking changes may occur without a major version bump until the API is stable.
-
-:::
 
 A file-based agent can declare **subagents**, specialist child agents it delegates to. The parent model sees each subagent as a delegation tool named after the subagent directory and calls that tool to hand off a task. The subagent's result returns to the parent conversation.
 

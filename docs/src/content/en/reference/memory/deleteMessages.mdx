@@ -1,6 +1,6 @@
 ---
 title: "Reference: Memory.deleteMessages() | Memory"
-description: "Documentation for the `Memory.deleteMessages()` method in Mastra, which deletes multiple messages by their IDs."
+description: "Use Memory.deleteMessages() to remove multiple messages by ID from a conversation thread and its configured storage provider."
 packages:
   - "@mastra/core"
 ---
@@ -44,7 +44,7 @@ await memory?.deleteMessages(['671ae63f-3a91-4082-a907-fe7de78e10ec'])
 
 ```typescript title="src/test-memory.ts"
 import { mastra } from './mastra'
-import { MastraDBMessage } from '@mastra/core'
+import type { MastraDBMessage } from '@mastra/core/agent'
 
 const agent = mastra.getAgent('agent')
 const memory = await agent.getMemory()

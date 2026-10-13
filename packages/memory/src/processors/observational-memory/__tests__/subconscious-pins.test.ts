@@ -1,13 +1,7 @@
 import { InMemoryStore } from '@mastra/core/storage';
 import { describe, expect, it } from 'vitest';
 
-import {
-  createKnowledgeWriteTools,
-  createPinnedTools,
-  listPinnedKnowledge,
-  PINNED_NODE_NAME,
-  Subconscious,
-} from '../subconscious';
+import { createPinnedTools, listPinnedKnowledge, PINNED_NODE_NAME, Subconscious } from '../subconscious';
 
 const resourceScope = ['org:acme', 'resource:user-42'];
 const threadScope = [...resourceScope, 'thread:alpha'];
@@ -42,17 +36,10 @@ describe('Subconscious pinned knowledge', () => {
     expect(new Subconscious({ pins: true }).resolved.pins).toEqual({
       maxPins: 20,
       maxCharacters: 2_000,
-      capturePinning: false,
     });
     expect(new Subconscious({ pins: { maxCharacters: 500, maxPins: 3 } }).resolved.pins).toEqual({
       maxPins: 3,
       maxCharacters: 500,
-      capturePinning: false,
-    });
-    expect(new Subconscious({ pins: { capturePinning: true } }).resolved.pins).toEqual({
-      maxPins: 20,
-      maxCharacters: 2_000,
-      capturePinning: true,
     });
     expect(() => new Subconscious({ pins: { maxCharacters: 100_000 } })).toThrow(/maxCharacters/);
     expect(() => new Subconscious({ pins: { maxCharacters: 0 } })).toThrow(/maxCharacters/);
@@ -70,18 +57,6 @@ describe('Subconscious pinned knowledge', () => {
     expect((rejected as { message: string }).message).toContain('scope');
     const { pins } = await listPinnedKnowledge({ store: await getStore(memory), scope: threadScope });
     expect(pins.map(pin => pin.text)).toEqual(['explicit default']);
-  });
-
-  it('honors a thread maxScope ceiling: the reserved node itself is created at the thread level', async () => {
-    const memory = createMemory();
-    // defaultScope deliberately left at resource: an unscoped pin must narrow to the ceiling, not throw.
-    const tools = createTools(memory, { maxScope: 'thread' });
-    const pinned = await tools.knowledge_pin!.execute!({ text: 'thread ceiling pin' } as any, {} as any);
-    const store = await getStore(memory);
-    const entity = await store.getNode(pinned.node);
-    expect(entity!.scope).toEqual(threadScope);
-    const { pins } = await listPinnedKnowledge({ store, scope: threadScope });
-    expect(pins.map(pin => pin.id)).toEqual([pinned.id]);
   });
 
   it('pins a KnowledgeRecord and assembles it into the pin set', async () => {
@@ -196,28 +171,5 @@ describe('Subconscious pinned knowledge', () => {
     const { pins, nodeId } = await listPinnedKnowledge({ store, scope: threadScope });
     expect(nodeId).toBe(a.node);
     expect(pins).toHaveLength(2);
-  });
-
-  it('stores a mixed-case reserved page name canonically so the guard and readers agree', async () => {
-    const memory = createMemory();
-    const tools = createKnowledgeWriteTools(memory as any, {
-      scope: threadScope,
-      sourceThreadId: 'alpha',
-      defaultScope: 'resource',
-    });
-    await expect(
-      tools.knowledge_write_node_content!.execute!(
-        { name: 'Capture-Guidance', content: 'x'.repeat(8_001) } as any,
-        {} as any,
-      ),
-    ).rejects.toThrow(/capture-guidance is limited/);
-    const written = await tools.knowledge_write_node_content!.execute!(
-      { name: 'Capture-Guidance', content: 'be concise' } as any,
-      {} as any,
-    );
-    expect(written.name).toBe('capture-guidance');
-    const store = await getStore(memory);
-    const byCanonicalName = await store.resolveNode({ name: 'capture-guidance', scope: threadScope });
-    expect(byCanonicalName?.id).toBe(written.id);
   });
 });

@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.streamLegacy() (Legacy) | Streaming"
-description: "Documentation for the legacy `Agent.streamLegacy()` method in Mastra agents. This method is deprecated and will be removed in a future version."
+description: "The .streamLegacy() method is the legacy version of the agent streaming API, used for real-time streaming of responses from V1 model agents."
 packages:
   - "@mastra/core"
 ---
@@ -95,7 +95,7 @@ await agent.streamLegacy('message for agent')
                   {
                     name: 'resource',
                     type: 'string',
-                    isOptional: false,
+                    isOptional: true,
                     description: 'Identifier for the user or resource associated with the thread.',
                   },
                 ],

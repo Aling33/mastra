@@ -1,6 +1,6 @@
 ---
 title: "Reference: BatchPartsProcessor | Processors"
-description: "Documentation for the BatchPartsProcessor in Mastra, which batches multiple stream parts together to reduce frequency of emissions."
+description: "The BatchPartsProcessor is an output processor that batches multiple stream parts together to reduce the frequency of emissions during streaming."
 packages:
   - "@mastra/core"
 ---
@@ -76,8 +76,8 @@ const processor = new BatchPartsProcessor({
   {
     name: 'name',
     type: 'string',
-    description: 'Optional processor display name',
-    isOptional: true,
+    description: 'Processor display name. Always `Batch Parts`.',
+    isOptional: false,
   },
   {
     name: 'processOutputStream',

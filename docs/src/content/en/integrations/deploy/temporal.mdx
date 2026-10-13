@@ -1,15 +1,11 @@
 ---
-title: "Temporal | Deploy"
-description: "Deploy Mastra workflows with Temporal"
+title: 'Temporal | Deploy'
+description: "Run Mastra workflows on Temporal with durable orchestration, retries, workers, task queues, suspension, activity execution, and local development."
 ---
 
 # Temporal
 
 [Temporal](https://temporal.io/) is a durable execution platform for orchestrating long-running, fault-tolerant workflows. The `@mastra/temporal` package lets you author workflows with the standard Mastra API and run them on a Temporal cluster.
-
-:::warning
-`@mastra/temporal` is experimental and not ready for production use. The API may change between releases. See the [package README](https://github.com/mastra-ai/mastra/tree/main/workflows/temporal) for the current state.
-:::
 
 ## How Temporal works with Mastra
 
@@ -29,7 +25,7 @@ Install the required packages:
 npm install @mastra/temporal@latest @temporalio/client @temporalio/worker @temporalio/envconfig
 ```
 
-You also need access to a Temporal cluster. For local development, you can run one with Docker (see [Running locally](#running-locally)).
+You also need access to a Temporal cluster. For local development, use the [Temporal CLI development server](https://docs.temporal.io/develop/run-a-development-server).
 
 ## Building a Temporal-backed workflow
 
@@ -55,6 +51,29 @@ export const { createWorkflow, createStep } = init({
 ```
 
 `loadClientConnectConfig()` reads standard Temporal environment variables such as `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, and mTLS settings. See the [Temporal envconfig docs](https://docs.temporal.io/develop/typescript/temporal-clients) for the full list.
+
+### Configure activity retries
+
+Pass `retry` to `init()` to set a Temporal activity retry policy for workflows created by these helpers. For example, add the following options to the initialization above to limit a failing activity to five total attempts:
+
+```ts
+export const { createWorkflow, createStep } = init({
+  client,
+  taskQueue: 'mastra',
+  startToCloseTimeout: '5 minutes',
+  retry: {
+    initialInterval: '5 seconds',
+    backoffCoefficient: 2,
+    maximumInterval: '5 minutes',
+    maximumAttempts: 5,
+    nonRetryableErrorTypes: ['ValidationError'],
+  },
+})
+```
+
+The policy applies to all generated activities, including steps, mappings, and conditions. Set `maximumAttempts: 1` to disable retries. Omitting `retry` preserves Temporal's default policy, which allows unlimited attempts. Mastra's workflow `retryConfig` doesn't configure Temporal activity retries.
+
+Keep retry options in the statically analyzable `init()` configuration so the worker build can include them. Inline object literal spreads are supported. Spreads of variables or function results are skipped during activity option extraction, so `retry` and `startToCloseTimeout` inside those spreads aren't forwarded to the generated workflow. Provide these options directly in `init()` or in an inline object literal spread instead. Rebuild and restart the worker after changing the policy.
 
 ### Creating steps
 
@@ -116,7 +135,7 @@ export const mastra = new Mastra({
 
 ## Running the worker
 
-The worker is a long-lived Node.js process that polls a Temporal task queue. Install `MastraPlugin` and point its `src` option at the Mastra entry file that registers your workflows.
+The worker is a long-lived Node.js process that polls a Temporal task queue. Install `MastraPlugin` and pass it the path to the Mastra entry file that registers your workflows.
 
 ```ts title="src/mastra/worker.ts"
 import { MastraPlugin } from '@mastra/temporal/worker'
@@ -126,11 +145,7 @@ const connection = await NativeConnection.connect({
   address: 'localhost:7233',
 })
 
-const mastraPlugin = new MastraPlugin()
-
-await mastraPlugin.prebuild({
-  entryFile: import.meta.resolve('./index.ts'),
-})
+const mastraPlugin = new MastraPlugin(import.meta.resolve('./index.ts'))
 
 const worker = await Worker.create({
   connection,
@@ -148,13 +163,13 @@ await worker.run()
 
 ### Running locally
 
-1. Start a local Temporal server. The simplest option is the `temporalio/auto-setup` Docker image:
+1. [Install the Temporal CLI](https://docs.temporal.io/cli/setup-cli), then start the local server:
 
    ```bash
-   docker run --rm -p 7233:7233 -p 8080:8080 temporalio/auto-setup:latest
+   temporal server start-dev --db-filename temporal.db
    ```
 
-1. Open the Temporal UI at [http://localhost:8080](http://localhost:8080) to inspect namespaces, workflows, and activities.
+1. Open the Temporal UI at [http://localhost:8233](http://localhost:8233) to inspect namespaces, workflows, and activities.
 
 1. In a new terminal, start the worker by running:
 

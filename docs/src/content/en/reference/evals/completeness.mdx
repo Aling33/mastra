@@ -1,6 +1,6 @@
 ---
 title: "Reference: Completeness scorer | Evals"
-description: Documentation for the Completeness Scorer in Mastra, which evaluates how thoroughly LLM outputs cover key elements present in the input.
+description: "The createCompletenessScorer() function evaluates how thoroughly an LLM's output covers the key elements present in the input."
 packages:
   - "@mastra/core"
   - "@mastra/evals"
@@ -41,10 +41,10 @@ This function returns an instance of the MastraScorer class. See the [MastraScor
 
 The `.run()` method returns a result in the following shape:
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   runId: string,
-  extractStepResult: {
+  preprocessStepResult: {
     inputElements: string[],
     outputElements: string[],
     missingElements: string[],
@@ -71,9 +71,9 @@ The extraction process includes:
 - Special handling of short words (3 characters or less)
 - Deduplication of elements
 
-### `extractStepResult`
+### `preprocessStepResult`
 
-From the `.run()` method, you can get the `extractStepResult` object with the following properties:
+From the `.run()` method, you can get the `preprocessStepResult` object with the following properties:
 
 - **inputElements**: Key elements found in the input (e.g., nouns, verbs, topics, terms).
 - **outputElements**: Key elements found in the output.
@@ -101,7 +101,7 @@ Final score: `(covered_elements / total_input_elements) * scale`
 
 A completeness score between 0 and 1:
 
-- **1.0**: Thoroughly addresses all aspects of the query with detailed detail.
+- **1.0**: Addresses all aspects of the query in detail.
 - **0.7 to 0.9**: Covers most important aspects with good detail, minor gaps.
 - **0.4 to 0.6**: Addresses some key points but missing important aspects or lacking detail.
 - **0.1 to 0.3**: Only partially addresses the query with substantial gaps.

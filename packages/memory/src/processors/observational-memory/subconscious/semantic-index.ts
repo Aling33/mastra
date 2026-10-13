@@ -4,7 +4,12 @@ import type {
   KnowledgeSemanticOutboxEntry,
   KnowledgeStorage,
 } from '@mastra/core/storage';
-import { canonicalizeKnowledgeScope, isKnowledgeScopeVisible } from '@mastra/core/storage';
+import {
+  canonicalizeKnowledgeScope,
+  isKnowledgeScopeVisible,
+  knowledgeScopeKey,
+  knowledgeVisibleScopeKeys,
+} from '@mastra/core/storage';
 import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '@mastra/core/vector';
 
 const DEFAULT_BATCH_SIZE = 50;
@@ -79,19 +84,14 @@ export class KnowledgeSemanticIndexCoordinator {
       );
     }
 
-    const visibleScopeKeys = scope.map((_, index) => scope.slice(0, index + 1).join('\u001f'));
-    const batches = await Promise.all(
-      visibleScopeKeys.map(scopeKey =>
-        this.#vector.query({
-          indexName,
-          queryVector: embedding,
-          topK: limit,
-          filter: { scope_key: scopeKey },
-        }),
-      ),
-    );
-    const deduped = new Map<string, (typeof batches)[number][number]>();
-    for (const candidate of batches.flat()) {
+    const candidates = await this.#vector.query({
+      indexName,
+      queryVector: embedding,
+      topK: limit,
+      filter: { scope_key: { $in: knowledgeVisibleScopeKeys(scope) } },
+    });
+    const deduped = new Map<string, (typeof candidates)[number]>();
+    for (const candidate of candidates) {
       const candidateScope = candidate.metadata?.scope;
       if (!Array.isArray(candidateScope)) continue;
       let visible = false;
@@ -193,7 +193,9 @@ export class KnowledgeSemanticIndexCoordinator {
       const node = await this.#knowledge.getNode(entry.documentId.slice('knowledge:node:'.length));
       if (!node || node.mergedInto) return null;
       return {
-        text: `${node.name}\n${node.content ?? ''}`,
+        text: node.description
+          ? `${node.name}\n${node.description}\n${node.content ?? ''}`
+          : `${node.name}\n${node.content ?? ''}`,
         name: node.name,
         scope: node.scope,
         recordId: node.id,
@@ -240,7 +242,7 @@ export class KnowledgeSemanticIndexCoordinator {
       record_id: document.recordId,
       name: document.name,
       scope: [...document.scope],
-      scope_key: document.scope.join('\u001f'),
+      scope_key: knowledgeScopeKey(document.scope),
       text: document.text,
     };
     for (const entry of document.scope) {

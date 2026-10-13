@@ -1,17 +1,11 @@
 ---
 title: "Server | File-based Agents"
-description: Configure the Mastra HTTP server by file convention with server.ts.
+description: "Mastra configures its HTTP server from a server.ts file directly under src/mastra/."
 packages:
   - "@mastra/core"
 ---
 
 # Server
-
-:::beta
-
-Breaking changes may occur without a major version bump until the API is stable.
-
-:::
 
 Mastra configures its HTTP [server](/docs/server/overview) from a `server.ts` file directly under `src/mastra/`. The server exposes agents, workflows, and other registered primitives as REST endpoints, and the file default-exports the same `ServerConfig` shape you'd pass to [`new Mastra()`](/reference/core/mastra-class).
 

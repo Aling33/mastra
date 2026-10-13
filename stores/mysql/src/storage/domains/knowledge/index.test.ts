@@ -20,6 +20,47 @@ const operations = new StoreOperationsMySQL({ pool, database });
 const createStore = () => new KnowledgeMySQL({ pool, operations });
 createKnowledgeStorageTests(createStore);
 
+describe('MySQL knowledge legacy schema upgrade', () => {
+  it('adds the description column to pre-existing tables and reads legacy rows as undefined', async () => {
+    const store = createStore();
+    await store.init();
+    // Recreate the pre-description table shape, then let init() upgrade it.
+    // Mutates the shared table; safe because vitest runs files serially (fileParallelism: false)
+    // and the shared suite's beforeEach re-runs init(), which re-adds the column.
+    await pool.query('ALTER TABLE `mastra_knowledge_nodes` DROP COLUMN description');
+    const legacyId = `legacy-${Date.now()}`;
+    await pool.query(
+      'INSERT INTO `mastra_knowledge_nodes` (id,type,name,canonicalName,kind,content,scope,scopeKey,version,mergedInto,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?)',
+      [
+        legacyId,
+        'node',
+        `Legacy ${legacyId}`,
+        `legacy ${legacyId}`,
+        'task',
+        'legacy body',
+        JSON.stringify(['org:legacy-upgrade']),
+        'org:legacy-upgrade',
+        1,
+        new Date(),
+        new Date(),
+      ],
+    );
+
+    const upgraded = createStore();
+    await upgraded.init();
+
+    const [columns] = await pool.query(
+      "SELECT COLUMN_NAME AS columnName FROM information_schema.columns WHERE table_schema=? AND table_name='mastra_knowledge_nodes'",
+      [database],
+    );
+    expect((columns as Array<{ columnName: string }>).map(row => row.columnName)).toContain('description');
+
+    const legacy = await upgraded.getNode(legacyId);
+    expect(legacy?.description).toBeUndefined();
+    expect(legacy?.content).toBe('legacy body');
+  });
+});
+
 describe('MySQL knowledge concurrency and indexes', () => {
   it('creates required indexes idempotently and exports its schema', async () => {
     const store = createStore();
@@ -33,16 +74,15 @@ describe('MySQL knowledge concurrency and indexes', () => {
     expect(indexes).toContain('idx_knowledge_nodes_identity');
     expect(indexes).toContain('idx_knowledge_outbox_idempotency');
     const ddl = KnowledgeMySQL.getExportDDL();
-    expect(ddl).toHaveLength(14);
+    expect(ddl).toHaveLength(16);
     expect(ddl.join('\n')).toContain('idx_knowledge_outbox_idempotency');
-    expect(ddl.join('\n')).toMatch(/PRIMARY KEY \(`sourceThreadId`, `agent`\)/);
+    expect(ddl.join('\n')).not.toContain('mastra_knowledge_cursors');
 
     const suffix = `export_${process.pid}_${Date.now().toString(36)}`;
     const tables = [
       'mastra_knowledge_mentions',
       'mastra_knowledge_nodes',
       'mastra_knowledge_records',
-      'mastra_knowledge_cursors',
       'mastra_knowledge_activity',
       'mastra_knowledge_semantic_outbox',
     ];
@@ -91,6 +131,17 @@ describe('MySQL knowledge concurrency and indexes', () => {
     expect(new Set(claims.map(claim => claim.id)).size).toBe(10);
   });
 
+  it('rejects the deprecated curation cursor methods without touching storage', async () => {
+    const store = createStore();
+    await store.init();
+    await expect(store.getCurationCursor({ sourceThreadId: 'thread', agent: 'curate' })).rejects.toThrow(
+      'Knowledge curation cursors were removed',
+    );
+    await expect(
+      store.advanceCurationCursor({ sourceThreadId: 'thread', agent: 'curate', lastKnowledgeId: '01A' }),
+    ).rejects.toThrow('Knowledge curation cursors were removed');
+  });
+
   it('allows only one concurrent CAS update', async () => {
     const store = createStore();
     await store.init();
@@ -102,18 +153,6 @@ describe('MySQL knowledge concurrency and indexes', () => {
     ]);
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
-  });
-
-  it('advances concurrent cursors monotonically', async () => {
-    const store = createStore();
-    await store.init();
-    await store.dangerouslyClearAll();
-    await Promise.all([
-      store.advanceCurationCursor({ sourceThreadId: 'thread', agent: 'curate', lastKnowledgeId: '01A' }),
-      store.advanceCurationCursor({ sourceThreadId: 'thread', agent: 'curate', lastKnowledgeId: '01C' }),
-      store.advanceCurationCursor({ sourceThreadId: 'thread', agent: 'curate', lastKnowledgeId: '01B' }),
-    ]);
-    expect((await store.getCurationCursor({ sourceThreadId: 'thread', agent: 'curate' }))?.lastKnowledgeId).toBe('01C');
   });
 });
 

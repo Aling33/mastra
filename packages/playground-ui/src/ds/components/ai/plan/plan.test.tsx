@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Button } from '../../Button';
 import { TooltipProvider } from '../../Tooltip';
@@ -23,8 +23,15 @@ import {
   PlanStatus,
   PlanTitle,
 } from './plan';
+import { toast } from '@/lib/toast';
 
 const renderPlan = (element: ReactNode) => render(<TooltipProvider>{element}</TooltipProvider>);
+
+/** Spied rather than module-mocked: `@/lib/toast` is one of our own services. */
+let toastSuccess: ReturnType<typeof vi.spyOn>;
+beforeEach(() => {
+  toastSuccess = vi.spyOn(toast, 'success').mockImplementation(() => '');
+});
 
 const mockClipboard = (writeText: ReturnType<typeof vi.fn>) => {
   Object.defineProperty(navigator, 'clipboard', {
@@ -102,6 +109,9 @@ describe('Plan', () => {
         'Review migration plan\n\nFile: /workspace/plans/migration.md\n\n## Steps',
       ),
     );
+
+    // The button says so on its own face; a toast on top would be noise.
+    expect(toastSuccess).not.toHaveBeenCalled();
   });
 
   it('preserves fixed copy behavior when unsupported button props are provided at runtime', async () => {
@@ -186,15 +196,16 @@ describe('Plan', () => {
 
     const clipped = document.querySelector<HTMLElement>('[data-slot="plan-content"][data-clipped]');
     expect(clipped).toBeTruthy();
-    expect(clipped?.classList.contains('mask-b-from-60%')).toBe(true);
-    expect(clipped?.classList.contains('mask-b-to-100%')).toBe(true);
+    // A bare marker attribute, so `[data-clipped]` styling matches on it.
+    expect(clipped?.getAttribute('data-clipped')).toBe('');
+    const masked = clipped?.querySelector<HTMLElement>('.mask-b-from-60\\%.mask-b-to-100\\%');
+    expect(masked?.style.maxHeight).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /expand plan/i }));
 
     const expanded = document.querySelector<HTMLElement>('[data-slot="plan-content"]');
     expect(expanded?.getAttribute('data-clipped')).toBeNull();
-    expect(expanded?.classList.contains('mask-b-from-60%')).toBe(false);
-    expect(expanded?.classList.contains('mask-b-to-100%')).toBe(false);
+    expect(expanded?.querySelector('.mask-b-from-60\\%')).toBeNull();
   });
 
   it('shows no clip hint or expand control when the plan fits the collapsed card', () => {
@@ -302,7 +313,9 @@ describe('Plan', () => {
       </Plan>,
     );
 
-    const measuredContent = document.querySelector('[data-slot="plan-content"] > div');
+    const measuredContent = document.querySelector(
+      '[data-slot="plan-content"] [data-slot="collapsible-box-clip"] > div',
+    );
     expect(observe).toHaveBeenCalledWith(measuredContent);
     expect(screen.queryByRole('button', { name: 'Expand plan' })).toBeNull();
 
@@ -332,8 +345,10 @@ describe('Plan', () => {
     const content = document.querySelector<HTMLElement>('[data-slot="plan-content"]');
     if (!content) throw new Error('Expected plan content to render.');
 
-    expect(content.style.maxHeight).toBe('220px');
-    expect(content.classList.contains('overflow-hidden')).toBe(true);
+    expect(content.querySelector<HTMLElement>('[data-slot="collapsible-box-clip"]')?.style.maxHeight).toBe('220px');
+    expect(content.querySelector('[data-slot="collapsible-box-clip"]')?.classList.contains('overflow-hidden')).toBe(
+      true,
+    );
 
     const expandButton = screen.getByRole('button', { name: 'Expand plan' });
     expect(expandButton.getAttribute('aria-label')).toBe('Expand plan');
@@ -343,8 +358,10 @@ describe('Plan', () => {
     const collapseButton = screen.getByRole('button', { name: 'Collapse plan' });
     expect(collapseButton.getAttribute('aria-label')).toBe('Collapse plan');
     expect(collapseButton.textContent).toContain('Collapse plan');
-    expect(content.style.maxHeight).toBe('');
-    expect(content.classList.contains('overflow-hidden')).toBe(false);
+    expect(content.querySelector<HTMLElement>('[data-slot="collapsible-box-clip"]')?.style.maxHeight).toBe('');
+    expect(content.querySelector('[data-slot="collapsible-box-clip"]')?.classList.contains('overflow-hidden')).toBe(
+      false,
+    );
   });
 
   it('keeps the expand and collapse action on one line without shrinking', () => {
@@ -389,7 +406,147 @@ describe('Plan', () => {
     fireEvent.click(expandButton);
 
     expect(screen.getByRole('button', { name: /collapse plan/i })).toBeTruthy();
-    expect(content.style.maxHeight).toBe('');
+    expect(content.querySelector<HTMLElement>('[data-slot="collapsible-box-clip"]')?.style.maxHeight).toBe('');
     expect(overrideClick).not.toHaveBeenCalled();
+  });
+});
+
+describe('Plan pieces on their own', () => {
+  it('refuses to render outside a Plan', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => render(<PlanExpandButton />)).toThrow('Plan compound components must be rendered inside <Plan>.');
+
+    consoleError.mockRestore();
+  });
+
+  it('labels itself Plan unless the caller says otherwise', () => {
+    renderPlan(
+      <Plan>
+        <PlanHeader>
+          <PlanLabel />
+        </PlanHeader>
+      </Plan>,
+    );
+
+    expect(screen.getByText('Plan')).toBeTruthy();
+  });
+
+  it('takes the label the caller gives it', () => {
+    renderPlan(
+      <Plan>
+        <PlanHeader>
+          <PlanLabel>Migration plan</PlanLabel>
+        </PlanHeader>
+      </Plan>,
+    );
+
+    expect(screen.getByText('Migration plan')).toBeTruthy();
+    expect(screen.queryByText('Plan')).toBeNull();
+  });
+
+  it('names the plan file it came from', () => {
+    renderPlan(
+      <Plan>
+        <PlanBody>
+          <PlanFile>docs/plans/2026-06-migration.md</PlanFile>
+        </PlanBody>
+      </Plan>,
+    );
+
+    expect(screen.getByText('Plan file')).toBeTruthy();
+    expect(screen.getByText('docs/plans/2026-06-migration.md')).toBeTruthy();
+  });
+});
+
+describe('PlanPath', () => {
+  const pathOf = (path: string) => {
+    const { container } = renderPlan(
+      <Plan>
+        <PlanBody>
+          <PlanPath>{path}</PlanPath>
+        </PlanBody>
+      </Plan>,
+    );
+    return container.querySelector('p');
+  };
+
+  it('shows the file name and keeps the whole path on hover', () => {
+    const path = pathOf('docs/plans/2026-06-migration.md');
+
+    expect(path?.textContent).toBe('2026-06-migration.md');
+    expect(path?.getAttribute('title')).toBe('docs/plans/2026-06-migration.md');
+  });
+
+  it('reads a Windows path the same way', () => {
+    expect(pathOf('docs\\plans\\migration.md')?.textContent).toBe('migration.md');
+  });
+
+  it('ignores a trailing separator', () => {
+    expect(pathOf('docs/plans/')?.textContent).toBe('plans');
+  });
+
+  it('shows a bare file name as it stands', () => {
+    expect(pathOf('migration.md')?.textContent).toBe('migration.md');
+  });
+
+  it('falls back to the path itself when there is nothing to take from it', () => {
+    expect(pathOf('/')?.getAttribute('title')).toBe('/');
+    expect(pathOf('/')?.textContent).toBe('/');
+  });
+});
+
+describe('PlanControls', () => {
+  const clippedPlan = (controls: ReactNode) => {
+    stubContentHeight(400);
+    return renderPlan(
+      <Plan>
+        <PlanMain>
+          <PlanContent>plan body</PlanContent>
+          <PlanControls>{controls}</PlanControls>
+        </PlanMain>
+      </Plan>,
+    );
+  };
+
+  it('offers the expand control on its own when nothing else was put in it', () => {
+    clippedPlan(null);
+
+    expect(screen.getByRole('button', { name: 'Expand plan' })).toBeTruthy();
+  });
+
+  it('lays out what the caller put in it, and drops the lone expand control', () => {
+    const { container } = clippedPlan(
+      <>
+        <PlanActionGroup>
+          <Button>Apply</Button>
+        </PlanActionGroup>
+        <PlanExpandButton />
+        <PlanActionGroup />
+      </>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Apply' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Expand plan' })).toBeTruthy();
+    // Three columns, so the expand control stays centred between the groups.
+    expect(container.querySelector('[class*="grid-cols-[1fr_auto_1fr]"]')).not.toBeNull();
+  });
+});
+
+describe('PlanContent without a ResizeObserver', () => {
+  it('still measures the plan once', () => {
+    vi.stubGlobal('ResizeObserver', undefined);
+    stubContentHeight(400);
+
+    renderPlan(
+      <Plan>
+        <PlanMain>
+          <PlanContent>plan body</PlanContent>
+          <PlanControls />
+        </PlanMain>
+      </Plan>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Expand plan' })).toBeTruthy();
   });
 });

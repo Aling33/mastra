@@ -16,10 +16,11 @@ import { TransformStream } from 'node:stream/web';
 import { coreFeatures } from '@mastra/core/features';
 import { SpanType } from '@mastra/core/observability';
 import type {
-  Span,
   EndGenerationOptions,
   ErrorSpanOptions,
   ModelInferenceContext,
+  ModelStepInput,
+  Span,
   TracingContext,
   UpdateSpanOptions,
 } from '@mastra/core/observability';
@@ -38,9 +39,10 @@ function supportsModelInference(): boolean {
   return coreFeatures.has('model-inference-span');
 }
 
-import { extractUsageMetrics } from './usage';
+import { extractOpenRouterCost, extractUsageMetrics } from './usage';
+import type { OpenRouterCostResult } from './usage';
 
-type StepInputPreview = Array<{ role: string; content: string }> | Record<string, unknown> | string | undefined;
+type StepInputPreview = ModelStepInput | undefined;
 
 function parseGatewayCost(providerMetadata: EndGenerationOptions['providerMetadata']): number | undefined {
   const rawCost = providerMetadata?.gateway?.cost;
@@ -84,6 +86,38 @@ function getGatewayCostContext({ stepProviderMetadata }: Pick<EndGenerationOptio
       source: 'provider_reported',
       sdkProvider: 'vercel_ai_gateway',
       sdkCostField: 'gateway.cost',
+      scope: 'query_total',
+      reportedStepCount: costs.length,
+    },
+  };
+}
+
+function getOpenRouterCostContext({ providerMetadata, stepProviderMetadata }: EndGenerationOptions, model?: string) {
+  const metadata = stepProviderMetadata ?? (providerMetadata ? [providerMetadata] : undefined);
+  if (!metadata?.some(step => step?.openrouter !== undefined)) return undefined;
+
+  const results = metadata.map(extractOpenRouterCost);
+  if (results.some(result => result === undefined)) return undefined;
+
+  const costs = results as OpenRouterCostResult[];
+  const estimatedCost = costs.reduce((total, result) => total + result.total, 0);
+  if (!Number.isFinite(estimatedCost)) return undefined;
+
+  const sdkCostFields: string[] = [];
+  if (costs.some(result => result.usedCost)) sdkCostFields.push('openrouter.usage.cost');
+  if (costs.some(result => result.usedUpstreamCost)) {
+    sdkCostFields.push('openrouter.usage.costDetails.upstreamInferenceCost');
+  }
+
+  return {
+    provider: 'openrouter',
+    model,
+    estimatedCost,
+    costUnit: 'USD',
+    costMetadata: {
+      source: 'provider_reported',
+      sdkProvider: 'openrouter',
+      sdkCostField: sdkCostFields.join('+'),
       scope: 'query_total',
       reportedStepCount: costs.length,
     },
@@ -335,6 +369,7 @@ export class ModelSpanTracker {
   #stepIndex: number = 0;
   #chunkSequence: number = 0;
   #completionStartTime?: Date;
+  #inferenceCompletionStartTime?: Date;
   #currentStepInputIsFinal: boolean = false;
   /** When true, step-finish chunks don't auto-close the step span (for durable execution) */
   #deferStepClose: boolean = false;
@@ -359,10 +394,9 @@ export class ModelSpanTracker {
    * Capture the completion start time (time to first token) when the first content chunk arrives.
    */
   #captureCompletionStartTime(): void {
-    if (this.#completionStartTime) {
-      return;
-    }
-    this.#completionStartTime = new Date();
+    const now = new Date();
+    this.#completionStartTime ??= now;
+    this.#inferenceCompletionStartTime ??= now;
   }
 
   /**
@@ -398,10 +432,20 @@ export class ModelSpanTracker {
    */
   endGeneration(options?: EndGenerationOptions): void {
     const { usage, providerMetadata, stepProviderMetadata, ...spanOptions } = options ?? {};
+    const model =
+      spanOptions.attributes?.responseModel ??
+      this.#modelSpan?.attributes?.responseModel ??
+      this.#modelSpan?.attributes?.model;
+    const providerCostContext = getOpenRouterCostContext({ providerMetadata, stepProviderMetadata }, model);
+
+    if (providerCostContext && !spanOptions.attributes) {
+      spanOptions.attributes = {};
+    }
 
     if (spanOptions.attributes) {
       spanOptions.attributes.completionStartTime = this.#completionStartTime;
       spanOptions.attributes.usage = extractUsageMetrics(usage, providerMetadata);
+      spanOptions.attributes.costContext = providerCostContext ?? spanOptions.attributes.costContext;
       if (!spanOptions.attributes.costContext) {
         spanOptions.attributes.costContext = getGatewayCostContext({ stepProviderMetadata });
       }
@@ -511,7 +555,7 @@ export class ModelSpanTracker {
         usage,
         finishReason: payload.stepResult.reason,
         warnings: payload.stepResult.warnings,
-        completionStartTime: this.#completionStartTime,
+        completionStartTime: this.#inferenceCompletionStartTime,
         ...(responseModel?.trim() ? { responseModel } : {}),
       },
     });
@@ -541,6 +585,7 @@ export class ModelSpanTracker {
       return;
     }
 
+    this.#inferenceCompletionStartTime = undefined;
     const input = extractStepInput(payload);
     const generationAttrs = this.#modelSpan?.attributes;
     const ctx = this.#inferenceContext;
@@ -555,12 +600,24 @@ export class ModelSpanTracker {
         ...(ctx?.parameters !== undefined ? { parameters: ctx.parameters } : {}),
         ...(ctx?.providerOptions !== undefined ? { providerOptions: ctx.providerOptions } : {}),
         ...(ctx?.availableTools !== undefined ? { availableTools: ctx.availableTools } : {}),
+        ...(ctx?.tools !== undefined ? { tools: ctx.tools } : {}),
         ...(ctx?.toolChoice !== undefined ? { toolChoice: ctx.toolChoice } : {}),
         ...(ctx?.responseFormat !== undefined ? { responseFormat: ctx.responseFormat } : {}),
       },
       input,
       tracingPolicy: this.#modelSpan?.tracingPolicy,
     });
+  }
+
+  /**
+   * End the open MODEL_INFERENCE span as interrupted while keeping MODEL_STEP open,
+   * so a replacement request for the same step gets its own inference span.
+   */
+  interruptInference(): void {
+    this.#endChunkSpan();
+    if (!this.#currentInferenceSpan) return;
+    this.#currentInferenceSpan.end({ attributes: { finishReason: 'interrupted' } });
+    this.#currentInferenceSpan = undefined;
   }
 
   /**
@@ -609,11 +666,14 @@ export class ModelSpanTracker {
 
     // Remove verbose/redundant fields from metadata:
     // - request: too verbose
+    // - body: raw provider HTTP response body; duplicates output/usage and can be very large.
+    //   `headers` is intentionally kept: it carries provider request IDs and rate-limit info
+    //   that are useful when debugging with the provider.
     // - id/timestamp: chunk-level data, not step-related
     // - modelId/modelVersion/modelProvider: duplicates of modelMetadata
     const cleanMetadata = metadata ? { ...metadata } : undefined;
     if (cleanMetadata) {
-      for (const key of ['request', 'id', 'timestamp', 'modelId', 'modelVersion', 'modelProvider']) {
+      for (const key of ['request', 'body', 'id', 'timestamp', 'modelId', 'modelVersion', 'modelProvider']) {
         delete cleanMetadata[key];
       }
     }

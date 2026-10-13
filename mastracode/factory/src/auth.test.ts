@@ -1,7 +1,11 @@
+import { MASTRA_MESSAGE_AUTHOR_KEY, RequestContext } from '@mastra/core/request-context';
+import type { IMastraAuthProvider } from '@mastra/core/server';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ensureFactoryAuthUser,
+  factoryUserOrgId,
   getFactoryAuthOrgId,
   getFactoryAuthUser,
   getFactoryAuthUserId,
@@ -22,6 +26,7 @@ const mockGetClearSessionHeaders = vi.fn(() => ({ 'Set-Cookie': 'wos_session=; P
 // the mock models "no org → org_new".
 const mockEnsureOrganization = vi.fn(async (_userId: string) => 'org_new');
 const mockIsOrganizationAdmin = vi.fn(async () => false);
+const mockConsumePendingResponseHeaders = vi.fn((_req: Request): Record<string, string> | undefined => undefined);
 
 vi.mock('@mastra/auth-workos', () => ({
   MastraAuthWorkos: class {
@@ -34,6 +39,7 @@ vi.mock('@mastra/auth-workos', () => ({
     getClearSessionHeaders = mockGetClearSessionHeaders;
     ensureOrganization = mockEnsureOrganization;
     isOrganizationAdmin = mockIsOrganizationAdmin;
+    consumePendingResponseHeaders = mockConsumePendingResponseHeaders;
   },
 }));
 
@@ -90,6 +96,40 @@ describe('env-implied WorkOS fallback', () => {
   });
 });
 
+describe('ensureFactoryAuthUser on ungated (requiresAuth: false) routes', () => {
+  async function buildUngatedApp() {
+    const { MastraAuthWorkos } = await import('@mastra/auth-workos');
+    const provider = new (MastraAuthWorkos as unknown as new () => IMastraAuthProvider)();
+    const app = new Hono();
+    app.get('/web/thing', async c => {
+      const user = await ensureFactoryAuthUser(provider, c);
+      return user ? c.json({ ok: true }) : c.json({ error: 'unauthorized' }, 401);
+    });
+    return app;
+  }
+
+  it('forwards a renewed session cookie on the handler response', async () => {
+    mockAuthenticate.mockResolvedValue({ id: 'user_1', email: 'a@b.com', organizationId: 'org_1' });
+    mockConsumePendingResponseHeaders.mockReturnValue({ 'Set-Cookie': 'wos-session=v2; Path=/; Max-Age=1209600' });
+    const app = await buildUngatedApp();
+
+    const res = await app.request('/web/thing', { headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('set-cookie')).toBe('wos-session=v2; Path=/; Max-Age=1209600');
+  });
+
+  it('still authenticates when forwarding headers throws', async () => {
+    mockAuthenticate.mockResolvedValue({ id: 'user_1', email: 'a@b.com', organizationId: 'org_1' });
+    mockConsumePendingResponseHeaders.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    const app = await buildUngatedApp();
+
+    const res = await app.request('/web/thing', { headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+  });
+});
+
 describe('mountFactoryAuth (disabled)', () => {
   it('is a no-op and leaves routes ungated', async () => {
     const { app, enabled } = buildApp();
@@ -103,6 +143,28 @@ describe('mountFactoryAuth (disabled)', () => {
 
 describe('mountFactoryAuth gate (enabled)', () => {
   beforeEach(enableEnv);
+
+  it('forwards a renewed session cookie from the provider on authenticated requests', async () => {
+    mockAuthenticate.mockResolvedValue({ id: 'user_1', email: 'a@b.com', organizationId: 'org_1' });
+    mockConsumePendingResponseHeaders.mockReturnValue({ 'Set-Cookie': 'wos-session=v2; Path=/; Max-Age=1209600' });
+    const { app } = buildApp();
+
+    const res = await app.request('/api/agents', { headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('set-cookie')).toBe('wos-session=v2; Path=/; Max-Age=1209600');
+    expect(mockConsumePendingResponseHeaders).toHaveBeenCalledWith(expect.any(Request));
+  });
+
+  it('still serves authenticated requests when forwarding headers throws', async () => {
+    mockAuthenticate.mockResolvedValue({ id: 'user_1', email: 'a@b.com', organizationId: 'org_1' });
+    mockConsumePendingResponseHeaders.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    const { app } = buildApp();
+
+    const res = await app.request('/api/agents', { headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+  });
 
   it('redirects unauthenticated HTML navigation to /signin with returnTo', async () => {
     mockAuthenticate.mockResolvedValue(null);
@@ -193,14 +255,27 @@ describe('mountFactoryAuth gate (enabled)', () => {
     expect(mockAuthenticate).not.toHaveBeenCalled();
   });
 
-  it('does not bypass auth for non-POST GitHub webhook requests', async () => {
+  it('lets unauthenticated GitLab webhook deliveries reach the token-verifying route handler', async () => {
     mockAuthenticate.mockResolvedValue(null);
     const { app } = buildApp();
 
-    const res = await app.request('/web/github/webhook', { method: 'GET', headers: { Accept: 'application/json' } });
-    expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: 'unauthorized' });
+    const res = await app.request('/web/gitlab/webhook', { method: 'POST', headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('ok');
+    expect(mockAuthenticate).not.toHaveBeenCalled();
   });
+
+  it.each(['/web/github/webhook', '/web/gitlab/webhook'])(
+    'does not bypass auth for non-POST webhook request %s',
+    async path => {
+      mockAuthenticate.mockResolvedValue(null);
+      const { app } = buildApp();
+
+      const res = await app.request(path, { method: 'GET', headers: { Accept: 'application/json' } });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
+    },
+  );
 
   it('lets unauthenticated channel webhook deliveries reach the route handler', async () => {
     mockAuthenticate.mockResolvedValue(null);
@@ -348,6 +423,113 @@ describe('mountFactoryAuth gate (enabled)', () => {
       avatarUrl: 'https://avatars.example/user.png',
     });
   });
+
+  it('names the signed-in user as the author of messages sent on this request', async () => {
+    mockAuthenticate.mockResolvedValue({
+      workosId: 'user_123',
+      email: 'user@example.com',
+      avatarUrl: 'https://avatars.example/user.png',
+    });
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('requestContext' as never, new RequestContext() as never);
+      await next();
+    });
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c =>
+      c.json((c.get('requestContext' as never) as RequestContext).get(MASTRA_MESSAGE_AUTHOR_KEY)),
+    );
+
+    const res = await app.request('/web/whoami', { headers: { Accept: 'application/json' } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      id: 'user_123',
+      name: 'user@example.com',
+      avatarUrl: 'https://avatars.example/user.png',
+    });
+  });
+
+  it('selects a requested bearer organization proven by provider memberships', async () => {
+    mockAuthenticate.mockResolvedValue({
+      workosId: 'user_123',
+      memberships: [
+        { id: 'membership_1', organizationId: 'org_1' },
+        { id: 'membership_2', organizationId: 'org_2' },
+      ],
+    });
+    const app = new Hono();
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c => c.json(factoryAuthTenant(c)));
+
+    const res = await app.request('/web/whoami', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer cli-token',
+        'X-Mastra-Organization-Id': 'org_2',
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ orgId: 'org_2', userId: 'user_123' });
+    expect(mockEnsureOrganization).not.toHaveBeenCalled();
+  });
+
+  it('selects a requested bearer organization proven by Studio membership ids', async () => {
+    mockAuthenticate.mockResolvedValue({
+      id: 'user_123',
+      organizationId: 'org_1',
+      memberOrgIds: ['org_1', 'org_2'],
+    });
+    const app = new Hono();
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c => c.json(factoryAuthTenant(c)));
+
+    const res = await app.request('/web/whoami', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer cli-token',
+        'X-Mastra-Organization-Id': 'org_2',
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ orgId: 'org_2', userId: 'user_123' });
+    expect(mockEnsureOrganization).not.toHaveBeenCalled();
+  });
+
+  it('rejects a requested bearer organization not present in provider memberships', async () => {
+    mockAuthenticate.mockResolvedValue({
+      workosId: 'user_123',
+      memberships: [{ id: 'membership_1', organizationId: 'org_1' }],
+    });
+    const { app } = buildApp();
+
+    const res = await app.request('/web/projects', {
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer cli-token',
+        'X-Mastra-Organization-Id': 'org_other',
+      },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'organization_forbidden' });
+    expect(mockEnsureOrganization).not.toHaveBeenCalled();
+  });
+
+  it('does not let an organization header change cookie-authenticated tenancy', async () => {
+    mockAuthenticate.mockResolvedValue({ workosId: 'user_123', organizationId: 'org_cookie' });
+    const app = new Hono();
+    mountFactoryAuth(app, { redirectUri: 'http://localhost:4111/auth/callback' });
+    app.get('/web/whoami', c => c.json(factoryAuthTenant(c)));
+
+    const res = await app.request('/web/whoami', {
+      headers: { Accept: 'application/json', 'X-Mastra-Organization-Id': 'org_other' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ orgId: 'org_cookie', userId: 'user_123' });
+  });
 });
 
 describe('mountFactoryAuth /auth routes (enabled)', () => {
@@ -443,6 +625,15 @@ describe('mountFactoryAuth /auth routes (enabled)', () => {
     expect(mockHandleCallback).not.toHaveBeenCalled();
   });
 
+  it('caps the denial values so a hostile IdP response cannot inflate the /signin URL', async () => {
+    const { app } = buildApp();
+    const res = await app.request(`/auth/callback?error=${'e'.repeat(200)}&error_description=${'d'.repeat(1000)}`);
+    expect(res.status).toBe(302);
+    const location = new URL(res.headers.get('location') ?? '', 'https://app.example');
+    expect(location.searchParams.get('error')).toBe('e'.repeat(64));
+    expect(location.searchParams.get('error_description')).toBe('d'.repeat(256));
+  });
+
   it('redirects callback back to login when the code exchange fails', async () => {
     mockHandleCallback.mockRejectedValue(new Error('expired code'));
     const { app } = buildApp();
@@ -478,14 +669,26 @@ describe('mountFactoryAuth /auth routes (enabled)', () => {
   });
 
   it('/auth/me reports the user when authenticated', async () => {
-    mockAuthenticate.mockResolvedValue({ workosId: 'user_me', email: 'user@example.com', name: 'User' });
+    mockAuthenticate.mockResolvedValue({
+      workosId: 'user_me',
+      email: 'user@example.com',
+      name: 'User',
+      avatarUrl: 'https://avatars.example/user.png',
+    });
     const { app } = buildApp();
     const res = await app.request('/auth/me');
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       authenticated: true,
+      telemetryEnabled: false,
       // No-org accounts are bootstrapped into a personal org during /auth/me.
-      user: { userId: 'user_me', email: 'user@example.com', name: 'User', organizationId: 'org_new' },
+      user: {
+        userId: 'user_me',
+        email: 'user@example.com',
+        name: 'User',
+        avatarUrl: 'https://avatars.example/user.png',
+        organizationId: 'org_new',
+      },
       provider: 'workos',
     });
     expect(mockEnsureOrganization).toHaveBeenCalledWith('user_me');
@@ -503,6 +706,7 @@ describe('mountFactoryAuth /auth routes (enabled)', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       authenticated: true,
+      telemetryEnabled: false,
       user: { email: 'user@example.com', name: 'User', organizationId: 'org_a', userId: 'user_1' },
       provider: 'workos',
     });
@@ -517,6 +721,14 @@ describe('org-tenant identity', () => {
     expect(getFactoryAuthOrgId({ workosId: 'user_1', organizationId: 'org_a' })).toBe('org_a');
     expect(getFactoryAuthOrgId({ workosId: 'user_1' })).toBeUndefined();
     expect(getFactoryAuthOrgId(undefined)).toBeUndefined();
+  });
+
+  it('factoryUserOrgId keys personal users on their own rung, never the shared local scope', () => {
+    expect(factoryUserOrgId({ workosId: 'user_1', organizationId: 'org_a' })).toBe('org_a');
+    expect(factoryUserOrgId({ id: 'user_2' })).toBe('user:user_2');
+    // No user at all means no per-user rung; callers fall back to `local`.
+    expect(factoryUserOrgId(undefined)).toBeUndefined();
+    expect(factoryUserOrgId({ email: 'no-id@example.com' })).toBeUndefined();
   });
 
   it('gate stashes organizationId and factoryAuthTenant returns { orgId, userId }', async () => {

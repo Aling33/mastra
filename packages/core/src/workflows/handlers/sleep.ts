@@ -1,10 +1,9 @@
-import { randomUUID } from 'node:crypto';
 import type { RequestContext } from '../../di';
 import type { PubSub } from '../../events/pubsub';
 import { SpanType, createObservabilityContext, resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
 import { ToolStream } from '../../tools/stream';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '../constants';
+import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL, WORKFLOW_CANCELLED_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
 import type { ExecuteFunction, InnerOutput } from '../step';
 import { getStepResult } from '../step';
@@ -16,6 +15,8 @@ import type {
   StepFlowEntry,
   StepResult,
 } from '../types';
+import { defineLazyWriter } from '../utils';
+import { getControlFlowIdentityAttributes } from './control-flow';
 
 export interface ExecuteSleepParams extends ObservabilityContext {
   workflowId: string;
@@ -24,6 +25,8 @@ export interface ExecuteSleepParams extends ObservabilityContext {
   entry: {
     type: 'sleep';
     id: string;
+    description?: string;
+    metadata?: Record<string, any>;
     duration?: number;
     fn?: ExecuteFunction<any, any, any, any, any, DefaultEngineType>;
   };
@@ -71,48 +74,54 @@ export async function executeSleep(engine: DefaultExecutionEngine, params: Execu
       attributes: {
         durationMs: duration,
         sleepType: fn ? 'dynamic' : 'fixed',
+        ...getControlFlowIdentityAttributes(entry),
       },
     },
     executionContext,
   });
 
   if (fn) {
-    const stepCallId = randomUUID();
+    const stepCallId = globalThis.crypto.randomUUID();
     duration = await engine.wrapDurableOperation(`workflow.${workflowId}.sleep.${entry.id}`, async () => {
-      return fn({
-        runId,
-        workflowId,
-        mastra: engine.mastra!,
-        requestContext,
-        inputData: prevOutput,
-        state: executionContext.state,
-        setState: async (state: any) => {
-          executionContext.state = state;
-        },
-        retryCount: -1,
-        ...createObservabilityContext({ currentSpan: sleepSpan }),
-        getInitData: () => stepResults?.input as any,
-        getStepResult: getStepResult.bind(null, stepResults),
-        // TODO: this function shouldn't have suspend probably?
-        suspend: async (_suspendPayload: any): Promise<any> => {},
-        bail: (() => {}) as () => InnerOutput,
-        abort: () => {
-          abortController?.abort();
-        },
-        [PUBSUB_SYMBOL]: pubsub,
-        [STREAM_FORMAT_SYMBOL]: executionContext.format,
-        engine: engine.getEngineContext(),
-        abortSignal: abortController?.signal,
-        writer: new ToolStream(
+      return fn(
+        defineLazyWriter(
           {
-            prefix: 'workflow-step',
-            callId: stepCallId,
-            name: 'sleep',
             runId,
+            workflowId,
+            mastra: engine.mastra!,
+            requestContext,
+            inputData: prevOutput,
+            state: executionContext.state,
+            setState: async (state: any) => {
+              executionContext.state = state;
+            },
+            retryCount: -1,
+            ...createObservabilityContext({ currentSpan: sleepSpan }),
+            getInitData: () => stepResults?.input as any,
+            getStepResult: getStepResult.bind(null, stepResults),
+            // TODO: this function shouldn't have suspend probably?
+            suspend: async (_suspendPayload: any): Promise<any> => {},
+            bail: (() => {}) as () => InnerOutput,
+            abort: () => {
+              abortController?.abort(WORKFLOW_CANCELLED_SYMBOL);
+            },
+            [PUBSUB_SYMBOL]: pubsub,
+            [STREAM_FORMAT_SYMBOL]: executionContext.format,
+            engine: engine.getEngineContext(),
+            abortSignal: abortController?.signal,
           },
-          outputWriter,
+          () =>
+            new ToolStream(
+              {
+                prefix: 'workflow-step',
+                callId: stepCallId,
+                name: 'sleep',
+                runId,
+              },
+              outputWriter,
+            ),
         ),
-      });
+      );
     });
 
     // Update sleep span with dynamic duration
@@ -151,6 +160,8 @@ export interface ExecuteSleepUntilParams extends ObservabilityContext {
   entry: {
     type: 'sleepUntil';
     id: string;
+    description?: string;
+    metadata?: Record<string, any>;
     date?: Date;
     fn?: ExecuteFunction<any, any, any, any, any, DefaultEngineType>;
   };
@@ -202,48 +213,54 @@ export async function executeSleepUntil(
         untilDate: date,
         durationMs: date ? Math.max(0, date.getTime() - Date.now()) : undefined,
         sleepType: fn ? 'dynamic' : 'fixed',
+        ...getControlFlowIdentityAttributes(entry),
       },
     },
     executionContext,
   });
 
   if (fn) {
-    const stepCallId = randomUUID();
+    const stepCallId = globalThis.crypto.randomUUID();
     const dateResult = await engine.wrapDurableOperation(`workflow.${workflowId}.sleepUntil.${entry.id}`, async () => {
-      return fn({
-        runId,
-        workflowId,
-        mastra: engine.mastra!,
-        requestContext,
-        inputData: prevOutput,
-        state: executionContext.state,
-        setState: async (state: any) => {
-          executionContext.state = state;
-        },
-        retryCount: -1,
-        ...createObservabilityContext({ currentSpan: sleepUntilSpan }),
-        getInitData: () => stepResults?.input as any,
-        getStepResult: getStepResult.bind(null, stepResults),
-        // TODO: this function shouldn't have suspend probably?
-        suspend: async (_suspendPayload: any): Promise<any> => {},
-        bail: (() => {}) as () => InnerOutput,
-        abort: () => {
-          abortController?.abort();
-        },
-        [PUBSUB_SYMBOL]: pubsub,
-        [STREAM_FORMAT_SYMBOL]: executionContext.format,
-        engine: engine.getEngineContext(),
-        abortSignal: abortController?.signal,
-        writer: new ToolStream(
+      return fn(
+        defineLazyWriter(
           {
-            prefix: 'workflow-step',
-            callId: stepCallId,
-            name: 'sleepUntil',
             runId,
+            workflowId,
+            mastra: engine.mastra!,
+            requestContext,
+            inputData: prevOutput,
+            state: executionContext.state,
+            setState: async (state: any) => {
+              executionContext.state = state;
+            },
+            retryCount: -1,
+            ...createObservabilityContext({ currentSpan: sleepUntilSpan }),
+            getInitData: () => stepResults?.input as any,
+            getStepResult: getStepResult.bind(null, stepResults),
+            // TODO: this function shouldn't have suspend probably?
+            suspend: async (_suspendPayload: any): Promise<any> => {},
+            bail: (() => {}) as () => InnerOutput,
+            abort: () => {
+              abortController?.abort(WORKFLOW_CANCELLED_SYMBOL);
+            },
+            [PUBSUB_SYMBOL]: pubsub,
+            [STREAM_FORMAT_SYMBOL]: executionContext.format,
+            engine: engine.getEngineContext(),
+            abortSignal: abortController?.signal,
           },
-          outputWriter,
+          () =>
+            new ToolStream(
+              {
+                prefix: 'workflow-step',
+                callId: stepCallId,
+                name: 'sleepUntil',
+                runId,
+              },
+              outputWriter,
+            ),
         ),
-      });
+      );
     });
     // Ensure date is a Date object (may be serialized as string by durable execution engines)
     date = dateResult instanceof Date ? dateResult : new Date(dateResult);

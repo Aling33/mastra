@@ -9,9 +9,15 @@
  * `import type` keeps this module type-only — no server runtime code is pulled
  * into the shared/platform-agnostic bundle.
  */
+import type { z } from 'zod';
+import type { FACTORY_ROUTE_CONTRACTS } from '@mastra/factory/routes/contracts';
+
+export type BoardCatalogResponse = z.infer<typeof FACTORY_ROUTE_CONTRACTS.boardCatalog.responseSchema>;
+export type InstalledBoardInfo = BoardCatalogResponse['boards'][number];
+export type InstalledPhaseInfo = InstalledBoardInfo['phases'][number];
+
 import type {
   CustomProviderInfo,
-  ModelPackInfo,
   OMConfigInfo,
   ProviderInfo,
   ProviderOMDefaultsResponse,
@@ -36,7 +42,6 @@ import type {
 export type {
   ProviderInfo,
   CustomProviderInfo,
-  ModelPackInfo,
   OMConfigInfo,
   ProviderOMDefaultsResponse,
   ThinkingConfigInfo,
@@ -69,10 +74,8 @@ export interface CustomProvidersResponse {
   providers: CustomProviderInfo[];
 }
 
-export interface ModelPacksResponse {
-  packs: ModelPackInfo[];
-  activePackId: string | null;
-  sessionPackId: string | null;
+export interface DefaultModelResponse {
+  modelId: string | null;
 }
 
 export interface OMResponse {
@@ -85,6 +88,8 @@ export interface FactorySkillInfo {
   description: string;
   /** SKILL.md body with the frontmatter removed. */
   content: string;
+  /** Set when the SKILL.md fails runtime parsing/validation; the agent will not be able to load the skill. */
+  error?: string;
 }
 
 export interface FactorySkillsResponse {
@@ -119,17 +124,6 @@ export interface SaveCustomProviderBody {
   models: string[];
   /** When editing, the id of the provider being replaced. */
   previousId?: string;
-}
-
-export interface SaveModelPackBody {
-  name: string;
-  models: { build: string; plan: string; fast: string };
-}
-
-export interface ActivateModelPackBody {
-  target: 'default' | 'session';
-  resourceId?: string;
-  scope?: string;
 }
 
 export interface UpdateOMModelBody {
@@ -173,15 +167,6 @@ export type OAuthPollResponse =
   | { status: 'pending'; nextPollMs: number }
   | { status: 'complete' }
   | { status: 'failed'; error: string };
-
-export type ActivateModelPackResponse =
-  | { ok: true; target: 'default'; activePackId: string }
-  | { ok: true; target: 'session'; sessionPackId: string };
-
-export interface ClearDefaultModelPackResponse {
-  ok: true;
-  activePackId: null;
-}
 
 export interface UpdateOMResponse {
   ok: true;

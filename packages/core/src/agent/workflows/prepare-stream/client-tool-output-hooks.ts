@@ -1,9 +1,11 @@
 import type { IMastraLogger } from '../../../logger';
+import { normalizeModelOutput } from '../../../loop/shared/normalize-model-output';
 import type { CoreTool } from '../../../tools/types';
-import type { MessageListInput } from '../../message-list';
+import type { MessageList, MessageListInput } from '../../message-list';
+import { normalizeToolOutput } from '../../message-list/utils/unwrap-legacy-tool-output';
 
 type ToolCall = { toolCallId: string; toolName: string };
-type ToolResult = ToolCall & { output: unknown };
+type ToolResult = ToolCall & { output: unknown; skip?: true };
 
 function getMessages(messages: MessageListInput): unknown[] {
   return Array.isArray(messages) ? messages : [messages];
@@ -40,19 +42,13 @@ function getToolResult(part: unknown): ToolResult | undefined {
   const record = part as Record<string, unknown>;
   if (record.type === 'tool-result' && typeof record.toolCallId === 'string' && typeof record.toolName === 'string') {
     const value = 'result' in record ? record.result : record.output;
-    // AI SDK v5 wraps tool output as `{ type: 'json' | 'text' | ..., value }`.
-    // Only unwrap that exact wrapper shape; a client result that merely happens
-    // to contain a `value` key must pass through untouched.
-    const isV5Wrapper =
-      typeof value === 'object' &&
-      value !== null &&
-      'type' in value &&
-      'value' in value &&
-      Object.keys(value).length === 2;
-    // `onOutput` is a success-only hook: skip v5 error result variants.
-    if (isV5Wrapper && (value.type === 'error-text' || value.type === 'error-json')) return;
-    const output = isV5Wrapper ? (value as Record<string, unknown>).value : value;
-    return { toolCallId: record.toolCallId, toolName: record.toolName, output };
+    const normalized = normalizeToolOutput(value);
+    return {
+      toolCallId: record.toolCallId,
+      toolName: record.toolName,
+      output: normalized.output,
+      ...(normalized.isError ? { skip: true as const } : {}),
+    };
   }
 
   if (record.type !== 'tool-invocation' || !record.toolInvocation || typeof record.toolInvocation !== 'object') return;
@@ -62,7 +58,13 @@ function getToolResult(part: unknown): ToolResult | undefined {
     typeof invocation.toolCallId === 'string' &&
     typeof invocation.toolName === 'string'
   ) {
-    return { toolCallId: invocation.toolCallId, toolName: invocation.toolName, output: invocation.result };
+    const normalized = normalizeToolOutput(invocation.result);
+    return {
+      toolCallId: invocation.toolCallId,
+      toolName: invocation.toolName,
+      output: normalized.output,
+      ...(normalized.isError ? { skip: true as const } : {}),
+    };
   }
 }
 
@@ -106,7 +108,7 @@ export async function fireClientToolOutputHooks({
   for (let i = lastAssistantIdx + 1; i < inputMessages.length; i++) {
     for (const part of getParts(inputMessages[i])) {
       const result = getToolResult(part);
-      if (!result || issuedCalls.get(result.toolCallId) !== result.toolName) continue;
+      if (!result || result.skip || issuedCalls.get(result.toolCallId) !== result.toolName) continue;
 
       const tool = tools[result.toolName];
       if (!tool || tool.execute || typeof tool.onOutput !== 'function') continue;
@@ -119,6 +121,94 @@ export async function fireClientToolOutputHooks({
           toolName: result.toolName,
           toolCallId: result.toolCallId,
         });
+      }
+    }
+  }
+}
+
+/**
+ * Apply a server-defined `toModelOutput` to client-supplied tool results.
+ *
+ * Client-side tools (no `execute`) never pass through the tool-execution step,
+ * so their results never get `toModelOutput` applied there. Mirror the AI SDK
+ * (`convertToModelMessages` maps every tool result, client-supplied included)
+ * by computing the mapping at ingestion and caching it at
+ * `providerMetadata.mastra.modelOutput` — the exact contract the execution
+ * path writes — so prompt conversion restores it with no downstream changes.
+ *
+ * Only this request's input messages are walked: results in memory-recalled
+ * history either already carry the cached mapping from the request that
+ * ingested them, or predate it and stay raw — re-mapping them here would
+ * re-run user code on every request without ever persisting.
+ *
+ * Mutates the MessageList's stored messages in place on purpose: prompt
+ * building reads these same part objects, and messages saved to memory carry
+ * the enrichment so reloads are cheap and idempotent.
+ */
+export async function applyClientToolModelOutput({
+  messageList,
+  tools,
+  logger,
+}: {
+  messageList: MessageList;
+  tools?: Record<string, CoreTool>;
+  logger?: Pick<IMastraLogger, 'error'>;
+}): Promise<void> {
+  if (!tools) return;
+  const isClientMappedTool = (
+    tool: CoreTool,
+  ): tool is CoreTool & { toModelOutput: NonNullable<CoreTool['toModelOutput']> } =>
+    !tool.execute && tool.type !== 'provider-defined' && typeof tool.toModelOutput === 'function';
+  if (!Object.values(tools).some(isClientMappedTool)) return;
+
+  for (const message of messageList.get.input.db()) {
+    if (message.role !== 'assistant' || message.content?.format !== 2 || !message.content.parts) continue;
+
+    for (const part of message.content.parts) {
+      if (part.type !== 'tool-invocation' || part.toolInvocation?.state !== 'result') continue;
+
+      const mastraMetadata = part.providerMetadata?.mastra;
+      // Idempotency: skip parts already mapped (retries, durable replays, and
+      // messages reloaded from DB that were enriched on a previous request).
+      if (
+        mastraMetadata &&
+        typeof mastraMetadata === 'object' &&
+        ('modelOutput' in mastraMetadata || mastraMetadata.modelOutputComputed)
+      ) {
+        continue;
+      }
+
+      const { toolName, toolCallId } = part.toolInvocation;
+      const tool = tools[toolName];
+      // Client-side tools only: tools WITH execute get toModelOutput applied at
+      // execution time by the tool-call step, and provider-executed tools are
+      // mapped by the provider round trip, not by us.
+      if (!tool || !isClientMappedTool(tool)) continue;
+
+      // Live ingestion pre-normalizes documented AI SDK wrappers, so an error
+      // variant sent by the client usually arrives here as a plain value and is
+      // NOT distinguishable from a success. This skip catches stored shapes
+      // that still carry the wrapper.
+      const normalized = normalizeToolOutput(part.toolInvocation.result);
+      if (normalized.isError) continue;
+
+      try {
+        const modelOutput = normalizeModelOutput(await tool.toModelOutput(normalized.output));
+        const nextMastra: Record<string, unknown> = {
+          ...(typeof mastraMetadata === 'object' ? mastraMetadata : undefined),
+          modelOutputComputed: true,
+        };
+        // A nullish return means "no special mapping needed" — keep the raw
+        // result but still mark the part computed.
+        if (modelOutput != null) nextMastra.modelOutput = modelOutput;
+        part.providerMetadata = {
+          ...part.providerMetadata,
+          mastra: nextMastra,
+        } as unknown as typeof part.providerMetadata;
+      } catch (error) {
+        // Client-tool mapping runs during preparation on an already-finished
+        // result, outside the execution path, so log and preserve the raw result.
+        logger?.error('Error calling client tool toModelOutput', { error, toolName, toolCallId });
       }
     }
   }

@@ -1,4 +1,6 @@
 import { APICallError } from '@internal/ai-sdk-v5';
+import { MastraFGAPermissions } from '../../../auth/ee';
+import type { MastraFGAPermissionInput } from '../../../auth/ee';
 import { MastraError, ErrorDomain, ErrorCategory } from '../../../error';
 import { getModelMethodFromAgentMethod } from '../../../llm/model/model-method-from-agent';
 import type { ModelLoopStreamArgs, ModelMethodType } from '../../../llm/model/model.loop.types';
@@ -8,14 +10,16 @@ import { createObservabilityContext } from '../../../observability';
 import type { Span, SpanType } from '../../../observability';
 import { StructuredOutputProcessor } from '../../../processors';
 import type { RequestContext } from '../../../request-context';
+import type { MastraOnFinishCallbackContext } from '../../../stream/types';
 import type { Step } from '../../../workflows/step';
 import type { InnerAgentExecutionOptions } from '../../agent.types';
-import type { MessageList } from '../../message-list';
+import type { MastraDBMessage, MessageList } from '../../message-list';
 import type { SaveQueueManager } from '../../save-queue';
+import { undoSavedResponseMessages } from '../../save-queue/undo-saved-response-messages';
 import { getModelOutputForTripwire } from '../../trip-wire';
 import type { AgentMethodType } from '../../types';
 import { isSupportedLanguageModel } from '../../utils';
-import { fireClientToolOutputHooks } from './client-tool-output-hooks';
+import { applyClientToolModelOutput, fireClientToolOutputHooks } from './client-tool-output-hooks';
 import type { PrepareStreamRunScope } from './run-scope';
 import {
   CONVERTED_TOOLS_KEY,
@@ -25,28 +29,6 @@ import {
   PROCESSOR_STATES_KEY,
 } from './run-scope-keys';
 import type { AgentCapabilities, PrepareMemoryStepOutput, PrepareToolsStepOutput } from './schema';
-
-/**
- * Assistant text that was already streamed to the caller when the abort happened.
- *
- * Prefers the snapshot taken when the abort signal fired. Falls back to the aborted finish
- * payload, which the stream builds from its own buffer at the abort event. Text a provider
- * emitted after cancellation is never included.
- */
-function getPartialAbortedText(
-  payload: { text?: string; finishReason?: string },
-  streamedTextAtAbort?: string,
-): string {
-  if (typeof streamedTextAtAbort === 'string' && streamedTextAtAbort.length > 0) {
-    return streamedTextAtAbort;
-  }
-
-  if (payload.finishReason === 'aborted' && typeof payload.text === 'string') {
-    return payload.text;
-  }
-
-  return '';
-}
 
 interface MapResultsStepOptions<OUTPUT = undefined> {
   capabilities: AgentCapabilities;
@@ -59,8 +41,10 @@ interface MapResultsStepOptions<OUTPUT = undefined> {
   memoryConfig?: MemoryConfigInternal;
   agentSpan?: Span<SpanType.AGENT_RUN>;
   agentId: string;
+  agentVersionId?: string;
   methodType: AgentMethodType;
   saveQueueManager?: SaveQueueManager;
+  authorizeMemory: (permission: MastraFGAPermissionInput, threadId: string) => Promise<void>;
   runScope: PrepareStreamRunScope<OUTPUT>;
 }
 
@@ -75,8 +59,10 @@ export function createMapResultsStep<OUTPUT = undefined>({
   memoryConfig,
   agentSpan,
   agentId,
+  agentVersionId,
   methodType,
   saveQueueManager,
+  authorizeMemory,
   runScope,
 }: MapResultsStepOptions<OUTPUT>): Step<
   string,
@@ -87,7 +73,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
   },
   ModelLoopStreamArgs<any, OUTPUT>
 >['execute'] {
-  return async ({ inputData, bail, ..._observabilityContext }) => {
+  return async ({ inputData, bail }) => {
     const memoryData = inputData['prepare-memory-step'];
 
     // Class instances written to runScope by upstream steps. These never travel
@@ -96,29 +82,15 @@ export function createMapResultsStep<OUTPUT = undefined>({
     const convertedTools = runScope.get(CONVERTED_TOOLS_KEY);
 
     let threadCreatedByStep = false;
-    const persistPartialOnAbort = options.persistPartialOnAbort === true;
-    // Text already handed to the caller. Snapshotted the moment the abort signal fires so
-    // chunks a provider keeps producing after cancellation can never widen the snapshot.
-    let streamedText = '';
-    let streamedTextAtAbort: string | undefined;
 
-    if (persistPartialOnAbort && options.abortSignal) {
-      if (options.abortSignal.aborted) {
-        streamedTextAtAbort = streamedText;
-      } else {
-        options.abortSignal.addEventListener(
-          'abort',
-          () => {
-            streamedTextAtAbort = streamedText;
-          },
-          { once: true },
-        );
-      }
-    }
+    // Output only ever merges into the latest message, so that is the only earlier-turn message
+    // snapshotted for undoSavedResponseMessages, after client tool output mapping has enriched it.
+    let earlierTurnSnapshot: MastraDBMessage | undefined;
 
     const result = {
       ...options,
       agentId,
+      agentVersionId,
       tools: convertedTools,
       runId,
       temperature: options.modelSettings?.temperature,
@@ -132,6 +104,9 @@ export function createMapResultsStep<OUTPUT = undefined>({
         // When OM is enabled saving per step corrupts things because OM handles its own saving
         const shouldSavePerStep = options.savePerStep && !memoryConfig?.observationalMemory;
         if (shouldSavePerStep && !memoryConfig?.readOnly) {
+          if (memoryData.thread?.id) {
+            await authorizeMemory(MastraFGAPermissions.MEMORY_WRITE, memoryData.thread.id);
+          }
           if (!memoryData.threadExists && !threadCreatedByStep && memory && memoryData.thread) {
             await memory.createThread({
               threadId: memoryData.thread?.id,
@@ -179,8 +154,10 @@ export function createMapResultsStep<OUTPUT = undefined>({
           messageList,
         });
 
-        // End agent span with tripwire information after fallback completes
+        // End the whole tree with tripwire information; descendants close
+        // without inheriting the terminal output
         agentSpan?.end({
+          endTree: true,
           output: { tripwire: memoryData.tripwire },
           attributes: {
             tripwireAbort: {
@@ -194,10 +171,25 @@ export function createMapResultsStep<OUTPUT = undefined>({
 
         return bail(modelOutput);
       } catch (error) {
-        // End agent span with error and tripwire context so failures aren't masked
+        // Record the error with tripwire context so failures aren't masked,
+        // then end the whole span tree. Rejections are not guaranteed to be
+        // Error instances; MastraError extracts a usable message from any
+        // cause shape.
+        const spanError =
+          error instanceof Error
+            ? error
+            : new MastraError(
+                {
+                  id: 'AGENT_TRIPWIRE_FALLBACK_FAILED',
+                  domain: ErrorDomain.AGENT,
+                  category: ErrorCategory.SYSTEM,
+                  details: { runId },
+                },
+                error,
+              );
         agentSpan?.error({
-          error: error as Error,
-          endSpan: true,
+          error: spanError,
+          endTree: true,
           attributes: {
             tripwireAbort: {
               reason: memoryData.tripwire?.reason,
@@ -222,6 +214,19 @@ export function createMapResultsStep<OUTPUT = undefined>({
       abortSignal: options.abortSignal,
       logger: capabilities.logger,
     });
+
+    // Apply server-defined toModelOutput to those same client-executed results.
+    // This enriches the ingested MessageList parts (not options.messages — the
+    // list converted its own copies in prepare-memory) so prompt conversion
+    // restores the mapped output.
+    await applyClientToolModelOutput({
+      messageList,
+      tools: convertedTools,
+      logger: capabilities.logger,
+    });
+
+    const latestMessage = messageList.get.all.db().at(-1);
+    earlierTurnSnapshot = latestMessage?.role === 'assistant' ? structuredClone(latestMessage) : undefined;
 
     // Resolve output processors - overrides replace user-configured but auto-derived (memory) are kept
     let effectiveOutputProcessors = capabilities.outputProcessors
@@ -261,30 +266,43 @@ export function createMapResultsStep<OUTPUT = undefined>({
         : options.inputProcessors || capabilities.inputProcessors
       : options.inputProcessors || [];
 
-    const effectiveLLMRequestInputProcessors = capabilities.llmRequestInputProcessors
-      ? typeof capabilities.llmRequestInputProcessors === 'function'
-        ? await capabilities.llmRequestInputProcessors({
-            requestContext: result.requestContext!,
-            overrides: options.inputProcessors,
-          })
-        : options.inputProcessors || capabilities.llmRequestInputProcessors
-      : effectiveInputProcessors;
-
-    // Resolve error processors
-    const effectiveErrorProcessors = capabilities.errorProcessors
+    // Resolve error processors once per run. The request lane below reuses this list, so a
+    // dynamic resolver runs a single time and both lanes share the same instances.
+    // `hasConfiguredErrorProcessors` reports whether the caller configured error processors
+    // themselves (constructor or call-time), excluding the framework's default stability
+    // processors. It gates the implicit retry-cap warning in resolveMaxProcessorRetries — the
+    // defaults self-limit, so warning about them is noise on every bare agent.
+    const { errorProcessors: effectiveErrorProcessors, hasConfiguredErrorProcessors } = capabilities.errorProcessors
       ? typeof capabilities.errorProcessors === 'function'
         ? await capabilities.errorProcessors({
             requestContext: result.requestContext!,
             overrides: options.errorProcessors,
           })
-        : options.errorProcessors || capabilities.errorProcessors
-      : options.errorProcessors || [];
+        : {
+            errorProcessors: options.errorProcessors || capabilities.errorProcessors,
+            hasConfiguredErrorProcessors: (options.errorProcessors || capabilities.errorProcessors).length > 0,
+          }
+      : {
+          errorProcessors: options.errorProcessors || [],
+          hasConfiguredErrorProcessors: !!options.errorProcessors?.length,
+        };
+
+    const effectiveLLMRequestInputProcessors = capabilities.llmRequestInputProcessors
+      ? typeof capabilities.llmRequestInputProcessors === 'function'
+        ? await capabilities.llmRequestInputProcessors({
+            requestContext: result.requestContext!,
+            overrides: options.inputProcessors,
+            errorOverrides: effectiveErrorProcessors,
+          })
+        : options.inputProcessors || capabilities.llmRequestInputProcessors
+      : effectiveInputProcessors;
 
     const modelMethodType: ModelMethodType = getModelMethodFromAgentMethod(methodType);
 
     const loopOptions = {
       methodType: modelMethodType,
       agentId,
+      agentVersionId,
       requestContext: result.requestContext!,
       actor: options.actor,
       mcp: options.mcp,
@@ -299,9 +317,10 @@ export function createMapResultsStep<OUTPUT = undefined>({
       providerOptions: result.providerOptions,
       includeRawChunks: options.includeRawChunks,
       experimentalTransform: options.experimentalTransform,
+      hideSignals: options.hideSignals,
       options: {
         ...(options.prepareStep && { prepareStep: options.prepareStep }),
-        onFinish: async (payload: any) => {
+        onFinish: async (payload: any, context?: MastraOnFinishCallbackContext) => {
           if (payload.finishReason === 'error') {
             const provider = payload.model?.provider;
             const modelId = payload.model?.modelId;
@@ -343,15 +362,16 @@ export function createMapResultsStep<OUTPUT = undefined>({
               });
             }
 
-            // End the AGENT_RUN span so the trace is exported.
-            // Without this, the span is orphaned and exporters that wait
-            // for the root span to end (e.g. Datadog) never emit the trace.
-            agentSpan?.error({ error, endSpan: true });
+            // Record the error, then end the whole span tree. Ending only the
+            // root would orphan still-open descendants, and exporters that wait
+            // for every span to finish (e.g. Datadog) retain the trace forever.
+            agentSpan?.error({ error, endTree: true });
             return;
           }
 
           if (payload.finishReason === 'suspended') {
             agentSpan?.end({
+              endTree: true,
               output: {
                 status: 'suspended',
                 reason: payload.suspendReason,
@@ -362,77 +382,39 @@ export function createMapResultsStep<OUTPUT = undefined>({
             return;
           }
 
-          // Both abort exits share one policy: persist nothing by default, and when the caller
-          // opts in persist only the assistant text that was streamed before the abort.
           const aborted = payload.finishReason === 'aborted' || options.abortSignal?.aborted === true;
 
           if (aborted) {
-            const endAbortedSpan = () => {
-              if (payload.finishReason === 'aborted') {
-                agentSpan?.end({ output: { status: 'aborted', reason: 'abort' } });
-              } else {
-                agentSpan?.end();
-              }
-            };
-
-            const partialText = getPartialAbortedText(payload, streamedTextAtAbort);
-
-            if (!persistPartialOnAbort || partialText.trim().length === 0) {
-              endAbortedSpan();
-            } else {
-              try {
-                await capabilities.executeOnFinish({
-                  // Bound the persisted response to the pre-abort snapshot. The raw payload may carry
-                  // a complete post-abort response (providers can ignore cancellation).
-                  result: {
-                    ...payload,
-                    text: partialText,
-                    response: {
-                      ...(payload.response ?? {}),
-                      dbMessages: undefined,
-                      messages: [{ role: 'assistant', content: [{ type: 'text', text: partialText }] }],
-                    },
-                  },
-                  outputText: partialText,
-                  thread: result.thread,
-                  threadId: result.threadId,
-                  readOnlyMemory: memoryConfig?.readOnly,
-                  resourceId,
-                  memoryConfig,
-                  requestContext,
-                  agentSpan,
-                  runId,
-                  messageList,
-                  threadExists: memoryData.threadExists || threadCreatedByStep,
-                  structuredOutput: false,
-                  overrideScorers: options.scorers,
-                  onTitleGenerated: options.memory?.onTitleGenerated,
-                  waitUntil: options.serverless?.waitUntil,
-                });
-
-                if (saveQueueManager && result.threadId && !memoryConfig?.readOnly) {
-                  await saveQueueManager.flushMessages(messageList, result.threadId, memoryConfig);
-                }
-              } catch (e) {
-                capabilities.logger.error('Error saving partial memory on abort', {
-                  error: e,
-                  runId,
-                });
-                endAbortedSpan();
-              }
-            }
-
-            // The aborted finish payload is synthetic; the caller already received onAbort.
             if (payload.finishReason === 'aborted') {
+              agentSpan?.end({ endTree: true, output: { status: 'aborted', reason: 'abort' } });
+              // The aborted finish payload is synthetic; the caller already received onAbort.
               return;
             }
+
+            agentSpan?.end({ endTree: true });
           } else {
+            if (context?.outputResultTripwire) {
+              await undoSavedResponseMessages({
+                memory,
+                threadId: memoryData.thread?.id ?? threadIdFromArgs,
+                memoryConfig,
+                messageList,
+                saveQueueManager,
+                earlierTurnSnapshot,
+                logger: capabilities.logger,
+                runId,
+              });
+            }
+
             try {
               const outputText =
                 options.structuredOutput?.schema && payload.object != null
                   ? JSON.stringify(payload.object)
                   : payload.text || '';
 
+              if (!memoryConfig?.readOnly && result.threadId) {
+                await authorizeMemory(MastraFGAPermissions.MEMORY_WRITE, result.threadId);
+              }
               await capabilities.executeOnFinish({
                 result: payload,
                 outputText,
@@ -448,6 +430,9 @@ export function createMapResultsStep<OUTPUT = undefined>({
                 threadExists: memoryData.threadExists || threadCreatedByStep,
                 structuredOutput: !!options.structuredOutput?.schema,
                 overrideScorers: options.scorers,
+                // Only streaming runs can deliver a `data-thread-title` chunk; `generate()` returns JSON.
+                writer: modelMethodType === 'stream' ? context?.writer : undefined,
+                abortSignal: options.abortSignal,
                 onTitleGenerated: options.memory?.onTitleGenerated,
                 waitUntil: options.serverless?.waitUntil,
               });
@@ -470,7 +455,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
                       e,
                     );
 
-              agentSpan?.error({ error: spanError, endSpan: true });
+              agentSpan?.error({ error: spanError, endTree: true });
             }
           }
 
@@ -483,14 +468,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
           });
         },
         onStepFinish: result.onStepFinish,
-        onChunk: persistPartialOnAbort
-          ? async (chunk: any) => {
-              if (chunk.type === 'text-delta') {
-                streamedText += chunk.payload.text;
-              }
-              await options.onChunk?.(chunk);
-            }
-          : options.onChunk,
+        onChunk: options.onChunk,
         onError: options.onError,
         onAbort: options.onAbort,
         abortSignal: options.abortSignal,
@@ -501,6 +479,7 @@ export function createMapResultsStep<OUTPUT = undefined>({
       llmRequestInputProcessors: effectiveLLMRequestInputProcessors,
       outputProcessors: effectiveOutputProcessors,
       errorProcessors: effectiveErrorProcessors,
+      hasConfiguredErrorProcessors,
       modelSettings: {
         ...(options.modelSettings || {}),
       },

@@ -1,17 +1,11 @@
 ---
 title: "Skills | File-based Agents"
-description: Add skills to a file-based agent under skills/ using modules or packaged SKILL.md files. Flat markdown is also supported.
+description: "A file-based agent discovers skills from its skills/ directory and bundles them at build time."
 packages:
   - "@mastra/core"
 ---
 
 # Skills
-
-:::beta
-
-Breaking changes may occur without a major version bump until the API is stable.
-
-:::
 
 A file-based agent discovers skills from its `skills/` directory and bundles them at build time. Skills are reusable procedures or reference material that the agent can load when relevant, instead of putting every detail into the always-on prompt.
 

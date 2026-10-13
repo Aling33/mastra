@@ -177,6 +177,19 @@ describe('registerTenantCredentialResolver', () => {
     expect(resolveCredentialStore(ctx)).toBe(resolveCredentialStore(ctx));
   });
 
+  it('allows deployment credentials only for providers the operator opted in', () => {
+    const ctx = new RequestContext();
+    ctx.set('user', { workosId: USER, organizationId: ORG });
+
+    registerTenantCredentialResolver(seed.credentials);
+    expect(resolveCredentialStore(ctx)?.allowsDeploymentCredentials?.('amazon-bedrock')).toBe(false);
+
+    registerTenantCredentialResolver(seed.credentials, new Set(['amazon-bedrock']));
+    const store = resolveCredentialStore(ctx);
+    expect(store?.allowsDeploymentCredentials?.('amazon-bedrock')).toBe(true);
+    expect(store?.allowsDeploymentCredentials?.('openai')).toBe(false);
+  });
+
   it('scopes personal accounts (no org) under a synthetic per-user org', async () => {
     registerTenantCredentialResolver(seed.credentials);
     const ctx = new RequestContext();
@@ -221,17 +234,21 @@ describe('createTenantCredentialPrimer', () => {
     return app;
   }
 
-  it('primes the caller snapshot so the first model call sees tenant credentials', async () => {
+  it('primes snapshots for both credential precedence modes', async () => {
     await seed.credentials.setCredential(USER_TENANT, 'openai', { type: 'api_key', key: 'user-key' });
+    await seed.credentials.setCredential(ORG_TENANT, 'openai', { type: 'api_key', key: 'org-key' });
     registerTenantCredentialResolver(seed.credentials);
 
     const res = await buildApp({ workosId: USER, organizationId: ORG }).request('/ok');
     expect(res.status).toBe(200);
 
-    const ctx = new RequestContext();
-    ctx.set('user', { workosId: USER, organizationId: ORG });
-    // Snapshot already hydrated by the primer — sync read works immediately.
-    expect(resolveCredentialStore(ctx)!.getStoredApiKey('openai')).toBe('user-key');
+    const userFirstContext = new RequestContext();
+    userFirstContext.set('user', { workosId: USER, organizationId: ORG });
+    expect(resolveCredentialStore(userFirstContext)!.getStoredApiKey('openai')).toBe('user-key');
+
+    const orgFirstContext = new RequestContext();
+    orgFirstContext.set('user', { workosId: USER, organizationId: ORG, orgFirstCredentials: true });
+    expect(resolveCredentialStore(orgFirstContext)!.getStoredApiKey('openai')).toBe('org-key');
   });
 
   it('passes unauthenticated requests through untouched', async () => {

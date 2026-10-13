@@ -1,6 +1,6 @@
 ---
 title: "Reference: MessageHistory | Processors"
-description: "Documentation for the MessageHistory processor in Mastra, which handles retrieval and persistence of conversation history."
+description: "The MessageHistory is a hybrid processor that handles both retrieval and persistence of message history."
 packages:
   - "@mastra/core"
   - "@mastra/pg"
@@ -89,9 +89,10 @@ const processor = new MessageHistory({
 ```typescript title="src/mastra/agents/memory-agent.ts"
 import { Agent } from '@mastra/core/agent'
 import { MessageHistory } from '@mastra/core/processors'
-import { PostgresStorage } from '@mastra/pg'
+import { PostgresStore } from '@mastra/pg'
 
-const storage = new PostgresStorage({
+const storage = new PostgresStore({
+  id: 'pg-storage',
   connectionString: process.env.DATABASE_URL,
 })
 

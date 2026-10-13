@@ -1,6 +1,6 @@
 ---
 title: "Reference: UnicodeNormalizer | Processors"
-description: "Documentation for the UnicodeNormalizer in Mastra, which normalizes Unicode text to ensure consistent formatting and remove potentially problematic characters."
+description: "Use UnicodeNormalizer to standardize input text into a selected Unicode form and remove problematic characters before messages reach the language model."
 packages:
   - "@mastra/core"
 ---
@@ -84,8 +84,8 @@ const processor = new UnicodeNormalizer({
   {
     name: 'name',
     type: 'string',
-    description: 'Optional processor display name',
-    isOptional: true,
+    description: 'Processor display name. Always `Unicode Normalizer`.',
+    isOptional: false,
   },
   {
     name: 'processInput',

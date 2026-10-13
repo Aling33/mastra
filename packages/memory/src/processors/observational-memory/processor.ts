@@ -1,9 +1,17 @@
 import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
 import { parseMemoryRequestContext } from '@mastra/core/memory';
-import type { ObservabilityContext } from '@mastra/core/observability';
-import type { Processor, ProcessInputStepArgs, ProcessOutputResultArgs } from '@mastra/core/processors';
+import type { MemoryRunState } from '@mastra/core/memory';
+import type { MemoryOperationAttributes, ObservabilityContext } from '@mastra/core/observability';
+import { SpanType } from '@mastra/core/observability';
+import type {
+  Processor,
+  ProcessInputStepArgs,
+  ProcessOutputResultArgs,
+  ProcessorSpanPhase,
+} from '@mastra/core/processors';
 import type { ObservationalMemoryRecord } from '@mastra/core/storage';
 
+import { runOMCommit } from './commit-queue';
 import { OBSERVATION_CONTINUATION_HINT } from './constants';
 import { omDebug } from './debug';
 import type { ObservationTurn } from './observation-turn/index';
@@ -29,7 +37,7 @@ function asLiveTurn(value: unknown): ObservationTurn | undefined {
 
 /** Subset of Memory that the processor needs — avoids circular imports. */
 export interface MemoryContextProvider {
-  getContext(opts: { threadId: string; resourceId?: string }): Promise<{
+  getContext(opts: { threadId: string; resourceId?: string; runState?: MemoryRunState }): Promise<{
     systemMessage: string | undefined;
     messages: MastraDBMessage[];
     hasObservations: boolean;
@@ -112,9 +120,34 @@ function injectObservationContextMessages({
   messageList.add(contMsg, 'memory');
 }
 
+/**
+ * Observational memory runs on the processor pipeline, but a user configures
+ * `memory`, not a processor — so its spans are labelled as memory operations
+ * rather than as anonymous pipeline entries.
+ *
+ * The two phases do different things and are named separately: the input step
+ * builds observation context into the system messages (a recall), and the
+ * output result persists what the turn produced (a save).
+ */
+const OM_PHASE_OPERATION: Partial<Record<ProcessorSpanPhase, NonNullable<MemoryOperationAttributes['operationType']>>> =
+  {
+    inputStep: 'recall',
+    output: 'save',
+    outputStep: 'save',
+  };
+
 export class ObservationalMemoryProcessor implements Processor<'observational-memory'> {
   readonly id = 'observational-memory' as const;
   readonly name = 'Observational Memory';
+
+  readonly spanType = SpanType.MEMORY_OPERATION;
+
+  readonly spanName = (phase: ProcessorSpanPhase): string => `memory: ${OM_PHASE_OPERATION[phase] ?? 'observational'}`;
+
+  readonly spanAttributes = (phase: ProcessorSpanPhase): Partial<MemoryOperationAttributes> => {
+    const operationType = OM_PHASE_OPERATION[phase];
+    return operationType ? { operationType } : {};
+  };
 
   /** The underlying ObservationalMemory engine. */
   readonly engine: ObservationalMemory;
@@ -174,10 +207,16 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
 
     const { threadId, resourceId } = context;
     const memoryContext = parseMemoryRequestContext(requestContext);
+    const runState = memoryContext?.runState?.();
     const readOnly = memoryContext?.memoryConfig?.readOnly;
 
-    const actorModelContext = model?.modelId
-      ? { provider: model.provider, modelId: model.modelId, providerOptions: args.providerOptions }
+    const actorModelContext = model
+      ? {
+          provider: model.provider,
+          modelId: model.modelId,
+          providerOptions: args.providerOptions,
+          model,
+        }
       : undefined;
     state.__omActorModelContext = actorModelContext;
 
@@ -201,18 +240,15 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
           messageList,
           threadId,
           resourceId,
+          runState,
         });
-        // Pass the record through even without observations — resource-scoped
-        // retrieval still injects recall guidance so the actor can browse and
-        // search other threads.
-        const systemMessages = ctx.omRecord
-          ? await this.engine.buildContextSystemMessages({
-              threadId,
-              resourceId,
-              record: ctx.omRecord,
-              unobservedContextBlocks: ctx.otherThreadsContext,
-            })
-          : undefined;
+        // Recall guidance is useful even with no record; null preserves read-only behavior.
+        const systemMessages = await this.engine.buildContextSystemMessages({
+          threadId,
+          resourceId,
+          record: ctx.omRecord,
+          unobservedContextBlocks: ctx.otherThreadsContext,
+        });
 
         injectObservationContextMessages({
           messageList,
@@ -242,6 +278,17 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
         state.__omTurn = undefined;
       }
 
+      // A turn can be sealed before the loop reaches its next step — for example when a
+      // sub-agent's `finish` / `step-finish` chunks are forwarded into the parent writer.
+      // Reusing an ended turn throws "Turn already ended" from `step()` below, so discard it
+      // and let beginTurn() start a fresh one, mirroring the message-list cleanup above.
+      if (activeTurn?.ended || this.turn?.ended) {
+        if (this.turn?.ended) {
+          this.turn = undefined;
+        }
+        state.__omTurn = undefined;
+      }
+
       if (!this.turn || !state.__omTurn) {
         // End previous turn if state was reset mid-flow
         if (this.turn && !state.__omTurn) {
@@ -263,7 +310,7 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
         this.turn.sendStateSignal = args.sendStateSignal;
         this.turn.agent = args.agent;
         this.turn.requestContext = requestContext;
-        await this.turn.start(this.memory);
+        await this.turn.start(this.memory, runState);
         if (stepNumber === 0 && this.temporalMarkers) {
           await insertTemporalGapMarkers({ messageList, sendSignal: args.sendSignal });
         }
@@ -293,6 +340,14 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
           const abortMessage = abortSignal?.aborted
             ? 'Agent execution was aborted'
             : `Encountered error during memory observation: ${err.message}`;
+          // A tripwire skips output processors, so end the turn here to save the user message and
+          // finished steps. The step that failed never reached the model, so nothing blocked is saved.
+          const failedTurn = this.turn;
+          await failedTurn.end().catch(() => {});
+          if (this.turn === failedTurn) {
+            this.turn = undefined;
+          }
+          state.__omTurn = undefined;
           if (typeof abort === 'function') {
             abort(abortMessage);
           }
@@ -326,7 +381,9 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
         // prepare() already counted the current unobserved window and resource context.
         const finalTotalPending = ctx.status.pendingTokens;
         try {
-          await this.engine.getStorage().setPendingMessageTokens(turnRecord.id, finalTotalPending);
+          await runOMCommit(this.engine.buffering.getLockKey(threadId, resourceId), () =>
+            this.engine.getStorage().setPendingMessageTokens(turnRecord.id, finalTotalPending),
+          );
           this.turn.patchRecord({ pendingMessageTokens: finalTotalPending });
         } catch {
           // Token persistence is intentionally non-fatal for streaming UX.
@@ -380,15 +437,27 @@ export class ObservationalMemoryProcessor implements Processor<'observational-me
         // Retrieve the turn from shared processor state — in production, the input
         // and output processors are separate instances (see comment in processInputStep).
         const turn = asLiveTurn(state.__omTurn) ?? this.turn;
-        if (turn) {
-          await turn.end();
-          this.turn = undefined;
-          state.__omTurn = undefined;
-        } else {
-          // No turn exists — this happens during a resumed stream where input processors
-          // were skipped (isResume=true), so processInputStep never created a turn.
-          // Directly persist any new response messages so the final assistant text
-          // from the resumed turn is not lost.
+        // The turn can already be sealed by the time the loop finalizes — for example when a
+        // sub-agent's `finish` / `step-finish` chunks are forwarded into the parent writer, or
+        // when a mid-loop seal left the shared state pointing at an ended turn. `end()` throws
+        // on an ended turn, and the refs are only cleared after it resolves, so a stale ended
+        // turn would reject finalization and never reach the direct-persist path below. Treat it
+        // as absent, mirroring the ended-turn cleanup in processInputStep.
+        const liveTurn = turn && !turn.ended ? turn : undefined;
+
+        if (liveTurn) {
+          // Use the pipeline's accepted terminal list as the persistence authority,
+          // rather than relying on the list captured when the turn began.
+          await liveTurn.end(messageList);
+        }
+        this.turn = undefined;
+        state.__omTurn = undefined;
+
+        if (!liveTurn) {
+          // No live turn exists — this happens during a resumed stream where input processors
+          // were skipped (isResume=true), so processInputStep never created a turn, or when the
+          // turn was already sealed before finalization. Directly persist any new response
+          // messages so the final assistant text from the resumed turn is not lost.
           const newOutput = messageList.get.response.db();
           const newInput = messageList.get.input.db();
           const messagesToSave = [...newInput, ...newOutput];

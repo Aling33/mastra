@@ -1,4 +1,6 @@
 import { MastraAuthWorkos } from '@mastra/auth-workos';
+import type { MessageAuthor } from '@mastra/core/agent-controller';
+import { MASTRA_MESSAGE_AUTHOR_KEY } from '@mastra/core/request-context';
 import {
   registerApiRoute,
   isAuthHttpHandler,
@@ -9,9 +11,19 @@ import {
 } from '@mastra/core/server';
 import type { ApiRoute, IMastraAuthProvider, ISessionProvider } from '@mastra/core/server';
 import type { Context, Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 
+import {
+  CUSTOM_DOMAIN_UNSUPPORTED_ERROR,
+  PLATFORM_AUTH_PROVIDER,
+  isPlatformAuthSupportedHost,
+} from './platform-auth-host.js';
 import type { RouteAuth } from './routes/route.js';
+import { actorFromAuthUser } from './storage/domains/comments/actor.js';
+import { isFactoryTelemetryEnabled } from './telemetry.js';
 import { timedAboveThreshold } from './timing.js';
+
+const ORGANIZATION_ID_HEADER = 'X-Mastra-Organization-Id';
 
 /**
  * Provider-neutral factory auth gating for the MastraCode web server.
@@ -53,6 +65,8 @@ export interface FactoryAuthUser {
    * isolated building instances. Absent for personal (no-org) accounts.
    */
   organizationId?: string;
+  /** Organization ids proven by the provider's authenticated membership response. */
+  organizationMembershipIds?: string[];
 }
 
 /**
@@ -144,6 +158,18 @@ export function getFactoryAuthOrgId(user: FactoryAuthUser | undefined): string |
 }
 
 /**
+ * The org rung a user's rows are keyed by: the organization they belong to, or a
+ * per-user rung for personal (no-org) accounts so their rows never land in the
+ * shared `local` scope. Every writer and reader of a `(org, user)` row must
+ * agree on this, so it lives here rather than being re-derived per call site.
+ */
+export function factoryUserOrgId(user: FactoryAuthUser | undefined): string | undefined {
+  const userId = getFactoryAuthUserId(user);
+  if (!userId) return undefined;
+  return getFactoryAuthOrgId(user) ?? `user:${userId}`;
+}
+
+/**
  * Resolve the tenant identity `(orgId, userId)` from the authenticated user on
  * the context. Returns `undefined` when there is no signed-in user (auth
  * disabled or unauthenticated). `orgId` is `undefined` for personal accounts;
@@ -155,6 +181,17 @@ export function factoryAuthTenant(c: Context): FactoryAuthTenant | undefined {
   const userId = getFactoryAuthUserId(user);
   if (!userId) return undefined;
   return { orgId: getFactoryAuthOrgId(user), userId };
+}
+
+function messageAuthor(user: FactoryAuthUser): MessageAuthor | undefined {
+  const userId = getFactoryAuthUserId(user);
+  if (!userId) return undefined;
+  const actor = actorFromAuthUser(userId, user);
+  return {
+    id: actor.id,
+    ...(actor.displayName ? { name: actor.displayName } : {}),
+    ...(actor.avatarUrl ? { avatarUrl: actor.avatarUrl } : {}),
+  };
 }
 
 /** True when both WorkOS credential env vars are present (legacy env gate). */
@@ -216,10 +253,23 @@ function toFactoryAuthUser(result: unknown): FactoryAuthUser | null {
     name?: unknown;
     avatarUrl?: unknown;
     organizationId?: unknown;
+    memberships?: unknown;
+    memberOrgIds?: unknown;
   };
   const id = typeof flat.id === 'string' ? flat.id : undefined;
   const workosId = typeof flat.workosId === 'string' ? flat.workosId : undefined;
   if (!id && !workosId) return null;
+  const membershipOrganizationIds = Array.isArray(flat.memberships)
+    ? flat.memberships.flatMap(membership => {
+        if (!membership || typeof membership !== 'object') return [];
+        const organizationId = (membership as { organizationId?: unknown }).organizationId;
+        return typeof organizationId === 'string' ? [organizationId] : [];
+      })
+    : [];
+  const memberOrgIds = Array.isArray(flat.memberOrgIds)
+    ? flat.memberOrgIds.filter((organizationId): organizationId is string => typeof organizationId === 'string')
+    : [];
+  const organizationMembershipIds = [...new Set([...membershipOrganizationIds, ...memberOrgIds])];
   return {
     id,
     workosId,
@@ -227,6 +277,7 @@ function toFactoryAuthUser(result: unknown): FactoryAuthUser | null {
     name: typeof flat.name === 'string' ? flat.name : undefined,
     avatarUrl: typeof flat.avatarUrl === 'string' ? flat.avatarUrl : undefined,
     organizationId: typeof flat.organizationId === 'string' ? flat.organizationId : undefined,
+    organizationMembershipIds,
   };
 }
 
@@ -266,6 +317,13 @@ async function ensureUserOrg(provider: IMastraAuthProvider, user: FactoryAuthUse
   } catch {
     // Best-effort: the user stays no-org until a later request succeeds.
   }
+}
+
+function selectRequestedOrganization(user: FactoryAuthUser, requestedOrganizationId: string): boolean {
+  if (user.organizationId === requestedOrganizationId) return true;
+  if (!user.organizationMembershipIds?.includes(requestedOrganizationId)) return false;
+  user.organizationId = requestedOrganizationId;
+  return true;
 }
 
 /**
@@ -347,6 +405,19 @@ export function getWorkOSProvider(provider: IMastraAuthProvider | undefined): Ma
  *
  * Returns `undefined` when there is no valid session (or auth is disabled).
  */
+function forwardPendingResponseHeaders(provider: IMastraAuthProvider, c: Context): void {
+  // Forward a renewed session cookie (e.g. rotated by the shared API during
+  // verification) so the browser's cookie stays current. Best-effort.
+  try {
+    const pending = provider.consumePendingResponseHeaders?.(c.req.raw);
+    for (const [name, value] of Object.entries(pending ?? {})) {
+      c.header(name, value, { append: true });
+    }
+  } catch {
+    // never fail a request over header forwarding
+  }
+}
+
 export async function ensureFactoryAuthUser(
   provider: IMastraAuthProvider | undefined,
   c: Context,
@@ -357,9 +428,19 @@ export async function ensureFactoryAuthUser(
 
   const token = getBearerToken(c.req.header('Authorization'));
   const user = await authenticateRequest(provider, token, c.req.raw);
+  // Routes declared `requiresAuth: false` skip the gate, so this is their only
+  // authentication — forward a renewed session cookie from here too.
+  forwardPendingResponseHeaders(provider, c);
   if (!user) return undefined;
 
-  await ensureUserOrg(provider, user);
+  const requestedOrganizationId = token ? c.req.header(ORGANIZATION_ID_HEADER)?.trim() : undefined;
+  if (requestedOrganizationId) {
+    if (!selectRequestedOrganization(user, requestedOrganizationId)) {
+      throw new HTTPException(403, { message: 'organization_forbidden' });
+    }
+  } else {
+    await ensureUserOrg(provider, user);
+  }
 
   c.set(FACTORY_AUTH_USER_KEY, user);
   return user;
@@ -391,20 +472,32 @@ function isNavigationRequest(path: string, accept: string | undefined): boolean 
   return (accept ?? '').includes('text/html');
 }
 
+function isPlatformAuthCustomDomain(provider: IMastraAuthProvider, publicUrl?: string): boolean {
+  return (
+    provider.name === PLATFORM_AUTH_PROVIDER &&
+    Boolean(publicUrl && !isPlatformAuthSupportedHost(new URL(publicUrl).hostname))
+  );
+}
+
 /**
  * Handle the provider-neutral `/auth/me` route: validate the session with the
  * active provider and report the signed-in user (no tokens) to the SPA.
  * `/auth/me` is public (the gate skips `/auth/*`), so it validates the session
  * itself rather than reading a value the gate would have stashed.
  */
-async function handleAuthMe(provider: IMastraAuthProvider, c: Context): Promise<Response> {
+async function handleAuthMe(provider: IMastraAuthProvider, c: Context, publicUrl?: string): Promise<Response> {
   const token = getBearerToken(c.req.header('Authorization'));
   const user = await authenticateRequest(provider, token, c.req.raw);
   // Provider identity for the SPA: `/signin` renders the hosted-login button
   // for WorkOS and an email/password form for better-auth (with sign-up hidden
   // when the provider disables it).
   const signUpDisabled = isCredentialsProvider(provider) && provider.isSignUpEnabled?.() === false;
-  const meta = { provider: provider.name, ...(signUpDisabled ? { signUpDisabled: true } : {}) };
+  const customDomainUnsupported = isPlatformAuthCustomDomain(provider, publicUrl);
+  const meta = {
+    provider: provider.name,
+    ...(signUpDisabled ? { signUpDisabled: true } : {}),
+    ...(customDomainUnsupported ? { customDomainUnsupported: true } : {}),
+  };
   if (!user) {
     return c.json({ authenticated: false, user: null, ...meta });
   }
@@ -413,10 +506,12 @@ async function handleAuthMe(provider: IMastraAuthProvider, c: Context): Promise<
   await ensureUserOrg(provider, user);
   return c.json({
     authenticated: true,
+    telemetryEnabled: isFactoryTelemetryEnabled(provider.name),
     user: {
       userId: getFactoryAuthUserId(user),
       email: user.email,
       name: user.name,
+      avatarUrl: user.avatarUrl,
       organizationId: user.organizationId,
     },
     ...meta,
@@ -522,6 +617,11 @@ function providerAuthRoutes(provider: IMastraAuthProvider, publicUrl?: string): 
         method: 'GET',
         handler: async c => {
           const returnTo = sanitizeReturnTo(c.req.query('returnTo'));
+          if (isPlatformAuthCustomDomain(provider, publicUrl)) {
+            const query = new URLSearchParams({ error: CUSTOM_DOMAIN_UNSUPPORTED_ERROR });
+            if (returnTo !== '/') query.set('returnTo', returnTo);
+            return c.redirect(`/signin?${query.toString()}`);
+          }
           const state = encodeState(returnTo);
           // Build the callback URL from the browser-facing public origin so
           // the OAuth round-trip lands back on the SPA's origin (in dev the
@@ -675,7 +775,7 @@ export function registerAuthRoutes(
     const methods = route.method === 'ALL' ? ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] : [route.method];
     app.on(methods, route.path, c => route.handler(c));
   }
-  app.get('/auth/me', c => handleAuthMe(provider, c));
+  app.get('/auth/me', c => handleAuthMe(provider, c, options.publicUrl));
 }
 
 /**
@@ -705,7 +805,22 @@ export function buildAuthRoutes(provider: IMastraAuthProvider, options: { public
     registerApiRoute('/auth/me', {
       method: 'GET',
       requiresAuth: false,
-      handler: c => handleAuthMe(provider, c as unknown as Context),
+      handler: c => handleAuthMe(provider, c as unknown as Context, options.publicUrl),
+    }),
+  ];
+}
+
+/**
+ * `/auth/*` routes for auth-disabled mode (`auth: null`). Only `/auth/me`, answering
+ * 404 — the UI's "auth disabled" signal. Without it the deployer's HTML catch-all
+ * answers `/auth/me` with 200 text/html and the UI retries forever.
+ */
+export function buildAuthDisabledRoutes(): ApiRoute[] {
+  return [
+    registerApiRoute('/auth/me', {
+      method: 'GET',
+      requiresAuth: false,
+      handler: c => c.json({ authEnabled: false, authenticated: false }, 404),
     }),
   ];
 }
@@ -739,7 +854,7 @@ export function createFactoryAuthGate(provider: IMastraAuthProvider) {
     if (path.startsWith('/auth/')) {
       return next();
     }
-    if (c.req.method === 'POST' && path === '/web/github/webhook') {
+    if (c.req.method === 'POST' && (path === '/web/github/webhook' || path === '/web/gitlab/webhook')) {
       return next();
     }
     // Inbound chat-channel webhooks (Slack events) carry no user session: they
@@ -790,13 +905,23 @@ export function createFactoryAuthGate(provider: IMastraAuthProvider) {
     const user = await timedAboveThreshold('auth.gate.authenticate', 1_000, () =>
       authenticateRequest(provider, token, c.req.raw),
     );
+    forwardPendingResponseHeaders(provider, c);
 
     if (user) {
-      // Bootstrap a personal org for no-org accounts so the org id resolves on
-      // this request (see ensureFactoryAuthUser for the rationale).
-      await ensureUserOrg(provider, user);
+      const requestedOrganizationId = token ? c.req.header(ORGANIZATION_ID_HEADER)?.trim() : undefined;
+      if (requestedOrganizationId) {
+        if (!selectRequestedOrganization(user, requestedOrganizationId)) {
+          return c.json({ error: 'organization_forbidden' }, 403);
+        }
+      } else {
+        // Bootstrap a personal org for no-org accounts so the org id resolves on
+        // this request (see ensureFactoryAuthUser for the rationale).
+        await ensureUserOrg(provider, user);
+      }
       c.set(FACTORY_AUTH_USER_KEY, user);
-      c.get('requestContext')?.set('user', user);
+      const requestContext = c.get('requestContext');
+      requestContext?.set('user', user);
+      requestContext?.set(MASTRA_MESSAGE_AUTHOR_KEY, messageAuthor(user));
       return next();
     }
 

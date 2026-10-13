@@ -1,51 +1,46 @@
-import { createHash } from 'node:crypto';
-
+import { resolveRequestThinkingLevel } from '@mastra/code-sdk/agents/model';
+import type { ThinkingLevel } from '@mastra/code-sdk/providers/openai-codex';
+import type { MastraCodeState } from '@mastra/code-sdk/schema';
 import type { MastraDBMessage, MessageList } from '@mastra/core/agent/message-list';
+import type { AgentControllerRequestContext } from '@mastra/core/agent-controller';
 import type {
   ComputeStateSignalArgs,
   ComputeStateSignalResult,
+  ProcessInputArgs,
   ProcessInputStepArgs,
   Processor,
 } from '@mastra/core/processors';
 
+import { boardForWorkItem, resolveBoardToolRule, workItemPhaseSemantics } from '../boards/index.js';
+import type { BoardRegistry } from '../boards/index.js';
 import type { FactoryRunBindingRecord, WorkItemsStorage, WorkItemRow } from '../storage/domains/work-items/base.js';
-import { getFactorySessionCoordinates } from './binding-context.js';
-import { resolveFactoryToolRule } from './resolve.js';
+import { findSessionRunBinding, getFactorySessionCoordinates } from './binding-context.js';
 import type { FactoryTransitionService } from './transition-service.js';
-import { isFactoryRuleStage } from './types.js';
+import { workItemSource } from './types.js';
 import type {
   FactoryCommitDecision,
-  FactoryRuleBoard,
   FactoryRuleDecision,
   FactoryRuleJsonValue,
   FactoryRuleStage,
-  FactoryRules,
   FactoryToolResultRuleContext,
 } from './types.js';
-import { normalizeFactoryRuleJsonValue, validateFactoryRuleDecisions } from './validation.js';
+import {
+  assertFactoryDecisionTarget,
+  normalizeFactoryRuleJsonValue,
+  validateFactoryRuleDecisions,
+} from './validation.js';
 
 const STATE_ID = 'factory-phase';
 const RULE_TIMEOUT_MS = 5_000;
 const TRANSCRIPT_PAGE_SIZE = 50;
 const MAX_LINKED_ITEMS = 5;
-function ruleStage(item: WorkItemRow | null | undefined): FactoryRuleStage | undefined {
-  const stage = item?.stages.length === 1 ? item.stages[0] : undefined;
-  return stage !== undefined && isFactoryRuleStage(stage) ? stage : undefined;
+function ruleStage(boards: BoardRegistry, item: WorkItemRow | null | undefined): string | undefined {
+  return item && workItemPhaseSemantics(boards, item) ? item.stages[0] : undefined;
 }
 
-function itemInRuleStage(item: WorkItemRow | null | undefined): item is WorkItemRow {
-  return ruleStage(item) !== undefined;
+function itemInRuleStage(boards: BoardRegistry, item: WorkItemRow | null | undefined): item is WorkItemRow {
+  return ruleStage(boards, item) !== undefined;
 }
-
-const PHASE_LABELS: Record<FactoryRuleStage, string> = {
-  intake: 'Intake',
-  triage: 'Investigating',
-  planning: 'Planning',
-  execute: 'Building',
-  review: 'Reviewing',
-  done: 'Done',
-  canceled: 'Canceled',
-};
 
 type PersistedMessageReader = {
   listMessages(input: {
@@ -68,33 +63,52 @@ type CompletedToolResult = {
   value: FactoryRuleJsonValue;
 };
 
-type PhaseSnapshotValue = {
-  bindingId?: string;
-  itemId?: string;
-  revision?: number;
-  stage?: string;
-  role?: string;
-  board?: FactoryRuleBoard;
-  ruleSetVersion?: string;
-  status: 'active' | 'none';
+function isApprovedPlanResult(result: CompletedToolResult): boolean {
+  if (result.toolName !== 'submit_plan' || result.status !== 'success') return false;
+  if (typeof result.value === 'string') return result.value.startsWith('Plan approved.');
+  if (!result.value || typeof result.value !== 'object' || Array.isArray(result.value)) return false;
+  const content = result.value.content;
+  return typeof content === 'string' && content.startsWith('Plan approved.');
+}
+
+type RuntimeSnapshot = {
+  modelId: string;
+  thinkingLevel: ThinkingLevel;
 };
 
-function workItemSource(item: WorkItemRow) {
-  if (!item.externalSource) return 'manual' as const;
-  if (item.externalSource.integrationId === 'linear') return 'linear-issue' as const;
-  // See transition-service: non-GitHub, non-Linear provenance (Slack threads)
-  // is a plain work item, not a GitHub issue.
-  if (item.externalSource.integrationId !== 'github') return 'manual' as const;
-  return item.externalSource.type === 'pull-request' ? ('github-pr' as const) : ('github-issue' as const);
+type ActivePhaseSnapshotBase = {
+  bindingId: string;
+  itemId: string;
+  revision: number;
+  stage: FactoryRuleStage;
+  role: string;
+  configVersion: string;
+  status: 'active';
+};
+
+type ActivePhaseSnapshotValue = ActivePhaseSnapshotBase & {
+  board: string;
+  modelId?: string;
+  thinkingLevel?: ThinkingLevel;
+};
+
+type PhaseSnapshotValue = ActivePhaseSnapshotValue | { bindingId?: string; status: 'none' };
+
+function reviewRuntimeFromRequestContext(requestContext: ComputeStateSignalArgs['requestContext']): RuntimeSnapshot {
+  if (!requestContext || typeof requestContext.get !== 'function') {
+    throw new Error('Factory review phase requires a controller request context.');
+  }
+  const context = requestContext.get<'controller', AgentControllerRequestContext<MastraCodeState>>('controller');
+  const modelId = context?.session?.modelId.trim();
+  if (!modelId) {
+    throw new Error('Factory review phase requires a selected session model.');
+  }
+  return { modelId, thinkingLevel: resolveRequestThinkingLevel(context) };
 }
 
 function workItemSourceKey(item: WorkItemRow): string | null {
   const source = item.externalSource;
   return source ? `${source.integrationId}:${source.type}:${source.externalId}` : null;
-}
-
-function boardForItem(item: WorkItemRow): FactoryRuleBoard {
-  return item.externalSource?.type === 'pull-request' ? 'review' : 'work';
 }
 
 function boundedError(value: unknown): FactoryRuleJsonValue {
@@ -172,15 +186,14 @@ function currentCompletedToolMessage(
   return undefined;
 }
 
-function phaseCacheKey(value: Omit<PhaseSnapshotValue, 'status'>, linked: WorkItemRow[]): string {
-  return createHash('sha256')
-    .update(
-      JSON.stringify({
-        ...value,
-        linked: linked.map(item => [item.id, item.revision, item.stages[0]]),
-      }),
-    )
-    .digest('hex');
+async function phaseCacheKey(value: ActivePhaseSnapshotValue, linked: WorkItemRow[]): Promise<string> {
+  const serialized = JSON.stringify({
+    ...value,
+    linked: linked.map(item => [item.id, item.revision, item.stages[0]]),
+  });
+  return Buffer.from(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(serialized))).toString(
+    'hex',
+  );
 }
 
 function escapeText(value: string): string {
@@ -213,14 +226,49 @@ async function withRuleTimeout<T>(operation: Promise<T>): Promise<T> {
   }
 }
 
+const reportedUnavailableMemorySettings = new WeakSet<object>();
+
+/**
+ * Marks this run's Factory memory settings as unavailable so memory falls back
+ * to auto, and tells the thread once per request that saved choices were not
+ * applied. The reserved request-context key keeps clients from spoofing it.
+ */
+export function reportMemorySettingsUnavailable(
+  requestContext: NonNullable<ProcessInputArgs['requestContext']>,
+  reason: string,
+): void {
+  requestContext.set('mastra__factoryMemorySettings', { status: 'unavailable', reason });
+  console.warn('[Factory Memory Settings] Failed to load settings for run', { error: reason });
+  if (reportedUnavailableMemorySettings.has(requestContext)) return;
+  reportedUnavailableMemorySettings.add(requestContext);
+  const controller = requestContext.get('controller') as
+    | Pick<AgentControllerRequestContext<MastraCodeState>, 'emitEvent'>
+    | undefined;
+  controller?.emitEvent?.({
+    type: 'error',
+    error: new Error(
+      'Memory settings could not be loaded for this run, so observational memory is using Auto models and default thresholds.',
+    ),
+    errorType: 'factory_memory_settings_unavailable',
+    retryable: false,
+  });
+}
+
 export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
   readonly id = STATE_ID;
   readonly stateId = STATE_ID;
+  /** Request contexts whose caller row is already resolved for this request. */
+  private readonly loadedMemorySettings = new WeakSet<object>();
 
   constructor(
     private readonly options: {
-      rules: FactoryRules;
+      configVersion: string;
       storage: WorkItemsStorage;
+      boards: BoardRegistry;
+      loadMemorySettings?: (args: {
+        requestContext: ProcessInputStepArgs['requestContext'];
+        binding: FactoryRunBindingRecord | null;
+      }) => Promise<void>;
       transitionService?: Pick<FactoryTransitionService, 'transition'>;
       messageReader?: PersistedMessageReader;
       recordPullRequestProvenance?: (input: {
@@ -236,15 +284,84 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
     },
   ) {}
 
+  /**
+   * Memory settings are caller state, not run state. Factory invokes this while
+   * resolving its configured processor list, before Agent resolves dynamic
+   * Memory and enumerates Memory's processors. This guarantees both the Memory
+   * options and its model callbacks see the authoritative row for this
+   * invocation. Doing this in `processInputStep` would be too late: Memory's
+   * input-step hook runs before configured processors.
+   */
+  async prepareMemorySettings(requestContext: ProcessInputArgs['requestContext']): Promise<void> {
+    await this.loadCallerMemorySettings(requestContext, undefined, true);
+  }
+
+  async processInput(args: ProcessInputArgs): Promise<MessageList> {
+    await this.loadCallerMemorySettings(args.requestContext);
+    return args.messageList;
+  }
+
   async processInputStep(args: ProcessInputStepArgs): Promise<MessageList | undefined> {
     const address = getFactorySessionCoordinates(args.requestContext);
-    if (!address) return;
-    const binding = await this.options.storage.findRunBindingBySession(address);
+    let binding: FactoryRunBindingRecord | null | undefined;
+    try {
+      binding = address ? await this.options.storage.findRunBindingBySession(address) : undefined;
+    } catch {
+      await this.loadCallerMemorySettings(args.requestContext, undefined);
+      return;
+    }
+    // Resumed runs skip the input-processor phase, so re-check here: it is a
+    // no-op once `processInput` already placed the row for this request. Passing
+    // `undefined` (not `null`) keeps the recovery lookup inside the loader, so a
+    // recovered session reaches its project row from this hook too.
+    await this.loadCallerMemorySettings(args.requestContext, binding);
     if (!binding || binding.status !== 'active') return;
     const completedToolCallIds = completedStepToolCallIds(args.steps);
     const completedMessage = currentCompletedToolMessage(args.messages, completedToolCallIds);
     if (completedMessage) {
       await this.ingestMessages(binding, [completedMessage], completedToolCallIds);
+    }
+  }
+
+  /**
+   * Loads the caller's row once per invocation. The input hook always refreshes
+   * it in case the controller reused a request context; later step hooks reuse
+   * that value (`undefined` means it has not been loaded yet; `null` means an
+   * empty row).
+   *
+   * The WeakSet covers loaders that do not set the context key themselves, so a
+   * request is still loaded once. A failed load records an unavailable sentinel
+   * (memory then runs both roles on auto with default thresholds) and is not
+   * marked loaded so the next step can retry.
+   */
+  private async loadCallerMemorySettings(
+    requestContext: ProcessInputStepArgs['requestContext'] | ProcessInputArgs['requestContext'],
+    binding?: FactoryRunBindingRecord | null,
+    force = false,
+  ): Promise<void> {
+    if (!requestContext || !this.options.loadMemorySettings) return;
+    const currentSettings = requestContext.get('mastra__factoryMemorySettings') as
+      | { status?: unknown }
+      | null
+      | undefined;
+    if (force) this.loadedMemorySettings.delete(requestContext);
+    if (!force && currentSettings !== undefined && currentSettings?.status !== 'unavailable') return;
+    if (!force && this.loadedMemorySettings.has(requestContext)) return;
+    try {
+      let runBinding = binding ?? null;
+      if (binding === undefined) {
+        const address = getFactorySessionCoordinates(requestContext);
+        runBinding = address
+          ? await this.options.storage.findRunBindingBySession(address)
+          : // Crash-recovered sessions come back with empty state, so the binding
+            // table is the last source of the project whose row applies. Without
+            // this the run would silently read the caller's personal row.
+            await findSessionRunBinding(requestContext, this.options.storage);
+      }
+      await this.options.loadMemorySettings({ requestContext, binding: runBinding });
+      this.loadedMemorySettings.add(requestContext);
+    } catch (error) {
+      reportMemorySettingsUnavailable(requestContext, error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -271,7 +388,7 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
     }
 
     const item = await this.options.storage.get({ orgId: binding.orgId, id: binding.workItemId });
-    const stage = ruleStage(item);
+    const stage = ruleStage(this.options.boards, item);
     if (!item || !stage) return;
     const allItems = await this.options.storage.list({
       orgId: binding.orgId,
@@ -280,28 +397,40 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
     const linked = allItems
       .filter(candidate => candidate.parentWorkItemId === item.id || item.parentWorkItemId === candidate.id)
       .slice(0, MAX_LINKED_ITEMS);
-    const board = boardForItem(item);
-    const value: PhaseSnapshotValue = {
+    const board = boardForWorkItem(item);
+    const baseValue: ActivePhaseSnapshotBase = {
       status: 'active',
       bindingId: binding.id,
       itemId: item.id,
       revision: item.revision,
       stage,
       role: binding.role,
-      board,
-      ruleSetVersion: this.options.rules.version,
+      configVersion: this.options.configVersion,
     };
-    const cacheKey = phaseCacheKey(value, linked);
+    const value: ActivePhaseSnapshotValue =
+      board === 'review'
+        ? { ...baseValue, board, ...reviewRuntimeFromRequestContext(args.requestContext) }
+        : { ...baseValue, board };
+    const cacheKey = await phaseCacheKey(value, linked);
     if (hasBase && (args.tracking?.currentCacheKey ?? args.lastSnapshot?.metadata?.state?.cacheKey) === cacheKey)
       return;
 
     const linkedText = linked.length
-      ? `\nLinked items: ${linked.map(candidate => `${workItemSource(candidate)} ${candidate.title}`).join('; ')}`
+      ? `\nLinked items: ${linked.map(candidate => `${workItemSource(candidate.externalSource)} ${candidate.title}`).join('; ')}`
       : '';
+    const phaseLabel = this.options.boards.get(board)?.phases[stage]?.title ?? stage;
+    const runtime =
+      value.modelId && value.thinkingLevel ? { modelId: value.modelId, thinkingLevel: value.thinkingLevel } : null;
     const snapshotContents =
-      `Factory ${board} phase: ${PHASE_LABELS[stage]} (${escapeText(stage)})\n` +
+      `Factory ${board} phase: ${escapeText(phaseLabel)} (${escapeText(stage)})\n` +
       `Work item: ${escapeText(item.title)} (${item.id})\n` +
-      `Role: ${escapeText(binding.role)}\nRevision: ${item.revision}\nRules: ${escapeText(this.options.rules.version)}\n` +
+      `Role: ${escapeText(binding.role)}\nRevision: ${item.revision}\nConfig: ${escapeText(this.options.configVersion)}\n` +
+      (runtime
+        ? `Runtime: model=${escapeText(runtime.modelId)}, reasoning-setting=${escapeText(runtime.thinkingLevel)}\n`
+        : '') +
+      ((board === 'work' || board === 'review') && stage === 'intake'
+        ? 'This card rests in Intake: its work is paused. Answer questions without moving it; when the user asks to resume, request the transition into the working stage first, then continue the work in this session.\n'
+        : '') +
       `Use factory_transition_work_item with expectedRevision ${item.revision} to request a phase change.${escapeText(linkedText)}`;
     const isDelta = hasBase && prior?.status === 'active';
     return {
@@ -312,7 +441,14 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
       contents: isDelta ? `Factory phase update:\n${snapshotContents}` : snapshotContents,
       value: { phase: value },
       ...(isDelta ? { delta: { phase: value } } : {}),
-      attributes: { status: 'active', board, stage, role: binding.role, revision: item.revision },
+      attributes: {
+        status: 'active',
+        board,
+        stage,
+        role: binding.role,
+        revision: item.revision,
+        ...(runtime ?? {}),
+      },
       metadata: { value: { phase: value } },
     };
   }
@@ -330,7 +466,7 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
     // single rule stage would ingest nothing, so skip the cursor and message
     // reads entirely instead of paying them on every walk.
     const item = await this.options.storage.get({ orgId: binding.orgId, id: binding.workItemId });
-    if (!itemInRuleStage(item)) return;
+    if (!itemInRuleStage(this.options.boards, item)) return;
     const cursor = await this.options.storage.getToolResultCursor(binding.orgId, binding.factoryProjectId, binding.id);
     let page = 0;
     while (true) {
@@ -366,7 +502,7 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
     preloadedItem?: WorkItemRow,
   ): Promise<void> {
     const item = preloadedItem ?? (await this.options.storage.get({ orgId: binding.orgId, id: binding.workItemId }));
-    if (!itemInRuleStage(item)) return;
+    if (!itemInRuleStage(this.options.boards, item)) return;
     for (const message of messages) {
       for (const toolResult of completedToolResults(message)) {
         if (toolCallIds && !toolCallIds.has(toolResult.toolCallId)) continue;
@@ -394,7 +530,8 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
     item: WorkItemRow,
     toolResult: CompletedToolResult,
   ): Promise<void> {
-    const rule = resolveFactoryToolRule(this.options.rules, toolResult.toolName);
+    const board = boardForWorkItem(item);
+    const rule = resolveBoardToolRule(this.options.boards, board, toolResult.toolName);
     if (!rule) return;
     const ingressId = JSON.stringify([
       binding.id,
@@ -408,22 +545,22 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
       ingressId,
     );
     if (prior) return;
-    const board = boardForItem(item);
     const context: FactoryToolResultRuleContext = {
       tenant: { orgId: binding.orgId, projectId: binding.factoryProjectId },
       actor: { type: 'agent', bindingId: binding.id, role: binding.role },
       ingress: { type: 'toolResult', id: ingressId },
       cause: `Completed ${toolResult.toolName}`,
       causalChain: [],
-      ruleSetVersion: this.options.rules.version,
+      configVersion: this.options.configVersion,
       item: {
         id: item.id,
-        source: workItemSource(item),
+        source: workItemSource(item.externalSource),
         sourceKey: workItemSourceKey(item),
         parentWorkItemId: item.parentWorkItemId,
         title: item.title,
         url: item.externalSource?.url ?? null,
         stages: item.stages,
+        acceptedAt: item.acceptedAt,
         metadata: item.metadata,
       },
       board,
@@ -443,7 +580,9 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
       if (decision?.type === 'reject') {
         outcome = { status: 'rejected', code: decision.code, reason: decision.reason };
       } else if (decision) {
-        decisions = validateFactoryRuleDecisions([decision]);
+        const validated = validateFactoryRuleDecisions([decision]);
+        for (const entry of validated) assertFactoryDecisionTarget(entry, this.options.boards, board);
+        decisions = validated;
       }
     } catch (error) {
       const timedOut = error instanceof Error && error.message === 'FACTORY_RULE_TIMEOUT';
@@ -462,7 +601,7 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
       factoryProjectId: binding.factoryProjectId,
       workItemId: item.id,
       ingress: { identity: ingressId, triggerType: 'tool.result' },
-      ruleSetVersion: this.options.rules.version,
+      configVersion: this.options.configVersion,
       expectedRevision: item.revision,
       actor: { ...context.actor },
       outcome,
@@ -484,6 +623,7 @@ export class FactoryPhaseStateProcessor implements Processor<'factory-phase'> {
         ingress: { type: 'rule', identity: `decision:${entry.idempotencyKey}` },
         cause: 'tool_result_rule',
         causalChain: [{ ingressId, decisionType: entry.type }],
+        ...(isApprovedPlanResult(toolResult) ? { planApproved: true } : {}),
       });
     }
   }

@@ -3,7 +3,7 @@
  * switcher must list it right away — the factories query is invalidated before
  * the wizard hands over to the new Factory.
  */
-import { MainSidebarProvider } from '@mastra/playground-ui/components/MainSidebar';
+import { SidebarProvider } from '@mastra/playground-ui/components/Sidebar';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { http, HttpResponse } from 'msw';
@@ -28,7 +28,6 @@ const repo = {
   private: false,
   installationId: 7,
   installationStorageId: 'inst-7',
-  repositoryStorageId: 'repo-99',
   sandboxProvider: 'local',
   sandboxWorkdir: '/workspace/hello',
 };
@@ -72,6 +71,8 @@ beforeEach(() => {
         },
       }),
     ),
+    http.get(`${TEST_BASE_URL}/web/intake/config`, () => HttpResponse.json({ config: {} })),
+    http.put(`${TEST_BASE_URL}/web/intake/config`, () => HttpResponse.json({ config: {} })),
     http.get(`${TEST_BASE_URL}/web/config/providers`, () =>
       HttpResponse.json({
         providers: [{ provider: 'anthropic', source: 'stored', oauth: { supported: true, modes: ['paste-code'] } }],
@@ -84,7 +85,6 @@ beforeEach(() => {
         ],
       }),
     ),
-    http.post(`${TEST_BASE_URL}/web/config/om/provider-defaults`, () => HttpResponse.json({ ok: true, config: {} })),
   );
 });
 
@@ -98,12 +98,12 @@ describe('factory creation refresh', () => {
     const user = userEvent.setup();
     renderWithProviders(
       <MemoryRouter initialEntries={['/factories/fp-host/new-factory']}>
-        <MainSidebarProvider storageKey="repro" mobileBreakpoint={768}>
+        <SidebarProvider storageKey="repro" mobileBreakpoint={768}>
           <FactorySwitcher />
           <Routes>
             <Route path="/factories/:factoryId/new-factory" element={<CreateFactoryWizard />} />
           </Routes>
-        </MainSidebarProvider>
+        </SidebarProvider>
       </MemoryRouter>,
     );
 

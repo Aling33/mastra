@@ -1,6 +1,6 @@
 ---
 title: "Reference: Scorer utils | Evals"
-description: Utility functions for extracting data from scorer run inputs and outputs, including text content, reasoning, system messages, and tool calls.
+description: "Mastra provides utility functions to help extract and process data from scorer run inputs and outputs. These utilities are particularly useful in the preprocess step of custom scorers."
 packages:
   - "@mastra/core"
   - "@mastra/evals"
@@ -41,7 +41,7 @@ import {
 
 ### `getAssistantMessageFromRunOutput`
 
-Extracts the text content from the first assistant message in the run output.
+Extracts the text content from the last assistant message that contains text in the run output. Trailing assistant messages without text (for example, tool-call-only messages) are skipped.
 
 ```typescript
 const scorer = createScorer({
@@ -75,7 +75,7 @@ const scorer = createScorer({
 
 Extracts the text content from the first user message in the run input.
 
-```typescript prettier:false
+```typescript oxfmt:false
 .preprocess(({ run }) => {
   const userMessage = getUserMessageFromRunInput(run.input);
   return { userMessage };
@@ -99,7 +99,7 @@ Extracts the text content from the first user message in the run input.
 
 Extracts text content from all input messages as an array.
 
-```typescript prettier:false
+```typescript oxfmt:false
 .preprocess(({ run }) => {
   const allUserMessages = extractInputMessages(run.input);
   return { conversationHistory: allUserMessages.join("\n") };
@@ -112,7 +112,7 @@ Extracts text content from all input messages as an array.
 
 Extracts text content from all assistant response messages as an array.
 
-```typescript prettier:false
+```typescript oxfmt:false
 .preprocess(({ run }) => {
   const allResponses = extractAgentResponseMessages(run.output);
   return { allResponses };
@@ -191,7 +191,7 @@ const reasoningQualityScorer = createScorer({
 
 Extracts all system messages from the run input, including both standard system messages and tagged system messages (specialized prompts like memory instructions).
 
-```typescript prettier:false
+```typescript oxfmt:false
 .preprocess(({ run }) => {
   const systemMessages = getSystemMessagesFromRunInput(run.input);
   return { 
@@ -207,7 +207,7 @@ Extracts all system messages from the run input, including both standard system 
 
 Combines all system messages into a single prompt string, joined with double newlines.
 
-```typescript prettier:false
+```typescript oxfmt:false
 .preprocess(({ run }) => {
   const fullSystemPrompt = getCombinedSystemPrompt(run.input);
   return { fullSystemPrompt };
@@ -245,7 +245,7 @@ const toolUsageScorer = createScorer({
 
 **Returns:**
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   tools: string[];           // Array of tool names
   toolCallInfos: ToolCallInfo[];  // Detailed tool call information
@@ -329,7 +329,7 @@ const trajectory = extractTrajectory(agentOutputMessages)
 // trajectory.rawOutput — the original MastraDBMessage[] array
 ```
 
-**Returns:** `Trajectory`: Contains `steps: TrajectoryStep[]`, `totalDurationMs`, and `rawOutput`.
+**Returns:** `Trajectory`: Contains `steps: TrajectoryStep[]` and `rawOutput`.
 
 ### `extractWorkflowTrajectory`
 
@@ -383,12 +383,12 @@ const trajectory = extractTrajectoryFromTrace(traceData.spans, rootSpanId)
 | `AGENT_RUN` | `agent_run` | `agentId` (from entity ID) |
 | `WORKFLOW_RUN` | `workflow_run` | `workflowId` (from entity ID) |
 | `WORKFLOW_STEP` | `workflow_step` | `output` |
-| `WORKFLOW_CONDITIONAL` | `workflow_conditional` | `conditionCount`, `selectedSteps` |
-| `WORKFLOW_PARALLEL` | `workflow_parallel` | `branchCount`, `parallelSteps` |
-| `WORKFLOW_LOOP` | `workflow_loop` | `loopType`, `totalIterations` |
-| `WORKFLOW_SLEEP` | `workflow_sleep` | `sleepDurationMs`, `sleepType` |
-| `WORKFLOW_WAIT_EVENT` | `workflow_wait_event` | `eventName`, `eventReceived` |
-| `PROCESSOR_RUN` | `processor_run` | `processorId` |
+| `WORKFLOW_CONDITIONAL` | `workflow_conditional` | Base fields only (`name`, `durationMs`, `metadata`) |
+| `WORKFLOW_PARALLEL` | `workflow_parallel` | Base fields only (`name`, `durationMs`, `metadata`) |
+| `WORKFLOW_LOOP` | `workflow_loop` | Base fields only (`name`, `durationMs`, `metadata`) |
+| `WORKFLOW_SLEEP` | `workflow_sleep` | Base fields only (`name`, `durationMs`, `metadata`) |
+| `WORKFLOW_WAIT_EVENT` | `workflow_wait_event` | Base fields only (`name`, `durationMs`, `metadata`) |
+| `PROCESSOR_RUN` | `processor_run` | Base fields only (`name`, `durationMs`, `metadata`) |
 
 Spans with types `GENERIC`, `MODEL_STEP`, `MODEL_CHUNK`, and `WORKFLOW_CONDITIONAL_EVAL` are skipped as noise.
 

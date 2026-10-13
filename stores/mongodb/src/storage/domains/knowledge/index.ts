@@ -1,6 +1,4 @@
 import {
-  assertKnowledgeCeilingRaised,
-  assertKnowledgeScopeWithinCeiling,
   canonicalizeKnowledgeScope,
   createKnowledgeUlid,
   isKnowledgeScopeVisible,
@@ -13,7 +11,6 @@ import {
   parseKnowledgeNodeCursor,
   parseKnowledgeWikilinks,
   TABLE_KNOWLEDGE_ACTIVITY,
-  TABLE_KNOWLEDGE_CURSORS,
   TABLE_KNOWLEDGE_RECORDS,
   TABLE_KNOWLEDGE_MENTIONS,
   TABLE_KNOWLEDGE_NODES,
@@ -32,10 +29,10 @@ import type {
   KnowledgeSemanticDocumentType,
   KnowledgeSemanticOperation,
   KnowledgeSemanticOutboxEntry,
+  ListKnowledgeNodesInput,
   QueryKnowledgeBySourceInput,
   QueryKnowledgeInput,
   QueryKnowledgeOutput,
-  ListKnowledgeNodesInput,
   SearchKnowledgeInput,
   SearchKnowledgeResult,
   UpdateKnowledgeNodeInput,
@@ -46,6 +43,43 @@ import type { MongoDBConnector } from '../../connectors/MongoDBConnector';
 import { resolveMongoDBConfig } from '../../db';
 import type { MongoDBDomainConfig } from '../../types';
 
+// #21830 shipped this helper in core 1.63.1; resolve it lazily so an older
+// installed core fails feature-detection instead of breaking module load.
+let assertDescriptionWithinBound: ((description: string | undefined) => void) | undefined;
+async function assertKnowledgeDescriptionWithinBoundCompat(description: string | undefined): Promise<void> {
+  let assertWithinBound = assertDescriptionWithinBound;
+  if (!assertWithinBound) {
+    const mod: Partial<typeof import('@mastra/core/storage')> = await import('@mastra/core/storage');
+    const resolvedAssert: (description: string | undefined) => void =
+      mod.assertKnowledgeDescriptionWithinBound ??
+      (value => {
+        if (value !== undefined && value.length > 400) {
+          throw new Error('Knowledge node description exceeds the 400 UTF-16 code unit limit');
+        }
+      });
+    assertDescriptionWithinBound = resolvedAssert;
+    assertWithinBound = resolvedAssert;
+  }
+  assertWithinBound(description);
+}
+
+let assertRecordTextWithinBound: ((text: string) => void) | undefined;
+async function assertKnowledgeRecordTextWithinBoundCompat(text: string): Promise<void> {
+  if (!assertRecordTextWithinBound) {
+    const mod: Partial<typeof import('@mastra/core/storage')> = await import('@mastra/core/storage');
+    assertRecordTextWithinBound =
+      mod.assertKnowledgeRecordTextWithinBound ??
+      (value => {
+        if (value.length > 1000) {
+          throw new Error(
+            'Knowledge record text exceeds the 1000 UTF-16 code unit limit; split it into separate facts or summarize it',
+          );
+        }
+      });
+  }
+  assertRecordTextWithinBound(text);
+}
+
 type Document = Record<string, any>;
 
 const cloneScope = (scope: KnowledgeScope): KnowledgeScope => [...scope];
@@ -55,7 +89,17 @@ const sessionOptions = (session?: ClientSession) => (session ? { session } : {})
 
 function visibleScopeKeys(scope: KnowledgeScope): string[] {
   const canonical = canonicalizeKnowledgeScope(scope);
-  return canonical.map((_, index) => knowledgeScopeKey(canonical.slice(0, index + 1)));
+  const subsets: KnowledgeScope[] = [[]];
+  for (const entry of canonical) subsets.push(...subsets.map(subset => [...subset, entry]));
+  const keys = new Set<string>();
+  for (const subset of subsets.slice(1)) {
+    try {
+      keys.add(knowledgeScopeKey(subset));
+    } catch {
+      // Invalid hierarchy fragments cannot be persisted scope keys.
+    }
+  }
+  return [...keys];
 }
 
 function recordCursorFilter(cursor: string, expected: { namePrefix?: string; kind?: string; hasContent?: boolean }) {
@@ -78,6 +122,7 @@ function nodeFromDocument(row: Document): KnowledgeNode {
     name: String(row.name),
     kind: String(row.kind),
     content: row.content == null ? undefined : String(row.content),
+    description: row.description == null ? undefined : String(row.description),
     scope: cloneScope(row.scope),
     version: Number(row.version),
     mergedInto: row.mergedInto ?? undefined,
@@ -95,7 +140,6 @@ function recordFromDocument(row: Document): KnowledgeRecord {
     sourceThreadId: String(row.sourceThreadId),
     capturedAt: new Date(row.capturedAt),
     when: row.when ? new Date(row.when) : undefined,
-    maxScope: row.maxScope ?? undefined,
     metadata: row.metadata ?? undefined,
     deletedAt: row.deletedAt ? new Date(row.deletedAt) : undefined,
     deletedBy: row.deletedBy ?? undefined,
@@ -120,12 +164,15 @@ function outboxFromDocument(row: Document): KnowledgeSemanticOutboxEntry {
   };
 }
 
+// Duplicated from Core so this adapter keeps working against Core versions that predate the deprecation.
+const KNOWLEDGE_CURATION_CURSOR_REMOVED_MESSAGE =
+  'Knowledge curation cursors were removed: observation-time curate is the only Knowledge writer and needs no cursor.';
+
 export class KnowledgeMongoDB extends KnowledgeStorage {
   static readonly MANAGED_COLLECTIONS = [
     TABLE_KNOWLEDGE_NODES,
     TABLE_KNOWLEDGE_RECORDS,
     TABLE_KNOWLEDGE_MENTIONS,
-    TABLE_KNOWLEDGE_CURSORS,
     TABLE_KNOWLEDGE_ACTIVITY,
     TABLE_KNOWLEDGE_SEMANTIC_OUTBOX,
   ] as const;
@@ -141,18 +188,19 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
     const nodes = await this.#collection(TABLE_KNOWLEDGE_NODES);
     const knowledge = await this.#collection(TABLE_KNOWLEDGE_RECORDS);
     const mentions = await this.#collection(TABLE_KNOWLEDGE_MENTIONS);
-    const cursors = await this.#collection(TABLE_KNOWLEDGE_CURSORS);
     const activity = await this.#collection(TABLE_KNOWLEDGE_ACTIVITY);
     const outbox = await this.#collection(TABLE_KNOWLEDGE_SEMANTIC_OUTBOX);
     await Promise.all([
       nodes.createIndex({ type: 1, scopeKey: 1, canonicalName: 1 }, { unique: true }),
       nodes.createIndex({ scopeKey: 1, type: 1 }),
+      nodes.createIndex({ type: 1, canonicalName: 1 }),
       knowledge.createIndex({ node: 1, id: -1 }),
       knowledge.createIndex({ sourceThreadId: 1, id: -1 }),
+      knowledge.createIndex({ scopeKey: 1, id: -1 }),
       mentions.createIndex({ sourceType: 1, sourceId: 1, recordId: 1 }, { unique: true }),
       mentions.createIndex({ recordId: 1, sourceType: 1, sourceId: 1 }),
-      cursors.createIndex({ sourceThreadId: 1, agent: 1 }, { unique: true }),
       activity.createIndex({ id: -1 }),
+      activity.createIndex({ scopeKey: 1, id: -1 }),
       outbox.createIndex({ idempotencyKey: 1 }, { unique: true }),
       outbox.createIndex({ status: 1, availableAt: 1, createdAt: 1 }),
     ]);
@@ -167,6 +215,13 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
   }
 
   async createNode(input: CreateKnowledgeNodeInput): Promise<KnowledgeNode> {
+    await assertKnowledgeDescriptionWithinBoundCompat(input.description);
+    if (input.scopeAddresses?.length) {
+      // Peer-floor safe: mirrors KnowledgeUnsupportedCapabilityError without importing it.
+      const error = new Error('This Knowledge storage adapter does not expose structural scope placement.');
+      error.name = 'KnowledgeUnsupportedCapabilityError';
+      throw error;
+    }
     const scope = canonicalizeKnowledgeScope(input.scope);
     return this.#connector.withTransaction(async session => {
       const existing = await this.#getNodeByName(input.name, scope, session);
@@ -184,6 +239,7 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
         name: input.name.trim(),
         kind: input.kind,
         content: input.content,
+        description: input.description,
         scope,
         version: 1,
         createdAt: now,
@@ -260,6 +316,7 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
   }
 
   async updateNode(input: UpdateKnowledgeNodeInput): Promise<KnowledgeNode> {
+    await assertKnowledgeDescriptionWithinBoundCompat(input.description);
     return this.#connector.withTransaction(async session => {
       const existing = await this.#getNode(input.id, session);
       if (!existing) throw new KnowledgeNotFoundError('node', input.id);
@@ -267,6 +324,7 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
       const scope = input.scope ? canonicalizeKnowledgeScope(input.scope) : existing.scope;
       const name = input.name?.trim() ?? existing.name;
       const content = input.content ?? existing.content;
+      const description = input.description ?? existing.description;
       const now = new Date();
       const result = await (
         await this.#nodes()
@@ -278,6 +336,7 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
             canonicalName: canonicalName(name),
             kind: input.kind ?? existing.kind,
             content: content ?? null,
+            description: description ?? null,
             scope,
             scopeKey: knowledgeScopeKey(scope),
             updatedAt: now,
@@ -351,17 +410,44 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
         if (scope)
           await this.#outbox(mention.sourceType, mention.sourceId, 'upsert', createKnowledgeUlid(), scope, session);
       }
+      // Merge matrix: a target that NEVER had a description (undefined — '' is an explicit curator
+      // clear and wins) adopts the source's; otherwise the target's state is preserved.
+      let mergedTarget = target;
+      if (target.description === undefined && source.description) {
+        const adoptedAt = new Date();
+        // Adoption is conditional on the target state this merge observed: a concurrent write (a new
+        // description, or an intentional '' clear) bumps the version and loses the predicate, so the
+        // merge leaves that newer value alone instead of clobbering it with the source's synopsis.
+        // `description: null` matches both a missing field (never written) and an explicit null,
+        // which are the two shapes a description-less node takes here.
+        const adopted = await (
+          await this.#nodes()
+        ).updateOne(
+          { id: target.id, type: 'node', version: target.version, description: null },
+          { $set: { description: source.description, updatedAt: adoptedAt }, $inc: { version: 1 } },
+          sessionOptions(session),
+        );
+        if (adopted.modifiedCount > 0) {
+          mergedTarget = {
+            ...target,
+            description: source.description,
+            version: target.version + 1,
+            updatedAt: adoptedAt,
+          };
+          await this.#activity('node-updated', 'node', target.id, target.scope, undefined, session);
+        }
+      }
       await this.#activity('node-merged', 'node', source.id, source.scope, undefined, session);
       await this.#outbox('node', source.id, 'delete', input.sourceVersion + 1, source.scope, session);
-      await this.#outbox('node', target.id, 'upsert', createKnowledgeUlid(), target.scope, session);
-      return target;
+      await this.#outbox('node', target.id, 'upsert', createKnowledgeUlid(), mergedTarget.scope, session);
+      return mergedTarget;
     });
   }
 
   async appendKnowledge(input: AppendKnowledgeInput): Promise<KnowledgeRecord> {
+    await assertKnowledgeRecordTextWithinBoundCompat(input.text);
     const scope = canonicalizeKnowledgeScope(input.scope);
     const defaultScope = canonicalizeKnowledgeScope(input.defaultScope);
-    assertKnowledgeScopeWithinCeiling(scope, input.maxScope);
     return this.#connector.withTransaction(async session => {
       const parent = await this.#resolveTerminalNode(nodeReferenceId(input.node), session);
       if (!parent) throw new KnowledgeNotFoundError('node', nodeReferenceId(input.node));
@@ -376,7 +462,6 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
         sourceThreadId: input.sourceThreadId,
         capturedAt: new Date(),
         when: input.when,
-        maxScope: input.maxScope,
         metadata: input.metadata,
       };
       await (
@@ -386,7 +471,6 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
           ...record,
           scopeKey: knowledgeScopeKey(scope),
           when: record.when ?? null,
-          maxScope: record.maxScope ?? null,
           deletedAt: null,
           deletedBy: null,
         },
@@ -477,7 +561,6 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
     return this.#connector.withTransaction(async session => {
       const record = await this.#getKnowledge(input.id, true, session);
       if (!record) throw new KnowledgeNotFoundError('record', input.id);
-      assertKnowledgeScopeWithinCeiling(scope, record.maxScope);
       await (
         await this.#knowledge()
       ).updateOne({ id: input.id }, { $set: { scope, scopeKey: knowledgeScopeKey(scope) } }, sessionOptions(session));
@@ -486,15 +569,6 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
       if (!record.deletedAt) await this.#outbox('record', input.id, 'upsert', createKnowledgeUlid(), scope, session);
       return { ...record, scope };
     });
-  }
-
-  async raiseKnowledgeCeiling(input: { id: string; maxScope?: KnowledgeRecord['maxScope'] }): Promise<KnowledgeRecord> {
-    const record = await this.#getKnowledge(input.id, true);
-    if (!record) throw new KnowledgeNotFoundError('record', input.id);
-    assertKnowledgeScopeWithinCeiling(record.scope, input.maxScope);
-    assertKnowledgeCeilingRaised(record.maxScope, input.maxScope);
-    await (await this.#knowledge()).updateOne({ id: input.id }, { $set: { maxScope: input.maxScope ?? null } });
-    return { ...record, maxScope: input.maxScope };
   }
 
   async search(input: SearchKnowledgeInput): Promise<SearchKnowledgeResult[]> {
@@ -509,7 +583,7 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
       .find({
         mergedInto: null,
         scopeKey: { $in: visibleScopeKeys(scope) },
-        $or: [{ name: regex }, { kind: regex }, { content: regex }],
+        $or: [{ name: regex }, { kind: regex }, { content: regex }, { description: regex }],
       })
       .sort({ updatedAt: -1 })
       .limit(limit)
@@ -519,7 +593,8 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
       id: row.id,
       recordId: row.id,
       name: row.name,
-      text: row.content ? `${row.name}\n${row.content}` : row.name,
+      // Description joins the snippet only when present so description-less results stay byte-identical.
+      text: [row.name, ...(row.description ? [row.description] : []), ...(row.content ? [row.content] : [])].join('\n'),
       scope: cloneScope(row.scope),
     }));
     if (results.length < limit) {
@@ -536,7 +611,7 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
         results.push({
           type: 'record',
           id: record.id,
-          recordId: record.node,
+          recordId: parentVisible ? record.node : record.id,
           name: parentVisible ? parent.name : '(private node)',
           text: record.text,
           scope: cloneScope(record.scope),
@@ -546,40 +621,24 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
     return results.slice(0, limit);
   }
 
-  async getCurationCursor(input: { sourceThreadId: string; agent: string }): Promise<KnowledgeCurationCursor | null> {
-    const row = await (await this.#cursors()).findOne(input);
-    return row
-      ? {
-          sourceThreadId: row.sourceThreadId,
-          agent: row.agent,
-          lastKnowledgeId: row.lastKnowledgeId,
-          updatedAt: new Date(row.updatedAt),
-        }
-      : null;
+  /**
+   * @deprecated Curation cursors were removed. Observation-time curate is the only Knowledge writer and needs no
+   * cursor. Always throws.
+   */
+  async getCurationCursor(_input: { sourceThreadId: string; agent: string }): Promise<KnowledgeCurationCursor | null> {
+    throw new Error(KNOWLEDGE_CURATION_CURSOR_REMOVED_MESSAGE);
   }
 
-  async advanceCurationCursor(input: {
+  /**
+   * @deprecated Curation cursors were removed. Observation-time curate is the only Knowledge writer and needs no
+   * cursor. Always throws.
+   */
+  async advanceCurationCursor(_input: {
     sourceThreadId: string;
     agent: string;
     lastKnowledgeId: string;
   }): Promise<KnowledgeCurationCursor> {
-    const row = await (
-      await this.#cursors()
-    ).findOneAndUpdate(
-      { sourceThreadId: input.sourceThreadId, agent: input.agent },
-      {
-        $max: { lastKnowledgeId: input.lastKnowledgeId },
-        $set: { updatedAt: new Date() },
-        $setOnInsert: { sourceThreadId: input.sourceThreadId, agent: input.agent },
-      },
-      { upsert: true, returnDocument: 'after' },
-    );
-    return {
-      sourceThreadId: row!.sourceThreadId,
-      agent: row!.agent,
-      lastKnowledgeId: row!.lastKnowledgeId,
-      updatedAt: new Date(row!.updatedAt),
-    };
+    throw new Error(KNOWLEDGE_CURATION_CURSOR_REMOVED_MESSAGE);
   }
 
   async listActivity(input: {
@@ -705,9 +764,6 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
   #mentions() {
     return this.#collection(TABLE_KNOWLEDGE_MENTIONS);
   }
-  #cursors() {
-    return this.#collection(TABLE_KNOWLEDGE_CURSORS);
-  }
   #activityCollection() {
     return this.#collection(TABLE_KNOWLEDGE_ACTIVITY);
   }
@@ -729,12 +785,24 @@ export class KnowledgeMongoDB extends KnowledgeStorage {
     return row ? nodeFromDocument(row) : null;
   }
   async #resolveNode(name: string, scope: KnowledgeScope, session?: ClientSession): Promise<KnowledgeNode | null> {
-    for (let length = scope.length; length > 0; length--) {
-      const node = await this.#getNodeByName(name, scope.slice(0, length), session);
-      if (node) {
-        const terminal = await this.#resolveTerminalNode(node.id, session);
-        if (terminal && isKnowledgeScopeVisible(terminal.scope, scope)) return terminal;
-      }
+    const rows = await (
+      await this.#nodes()
+    )
+      .find(
+        // An unmerged node outside the caller's scope resolves to itself and can never be visible, so only
+        // visible-scope rows and merged aliases (whose terminal may be visible) are candidates.
+        {
+          type: 'node',
+          canonicalName: canonicalName(name),
+          $or: [{ scopeKey: { $in: visibleScopeKeys(scope) } }, { mergedInto: { $ne: null } }],
+        },
+        sessionOptions(session),
+      )
+      .toArray();
+    const candidates = rows.map(nodeFromDocument).sort((left, right) => right.scope.length - left.scope.length);
+    for (const candidate of candidates) {
+      const terminal = await this.#resolveTerminalNode(candidate.id, session);
+      if (terminal && isKnowledgeScopeVisible(terminal.scope, scope)) return terminal;
     }
     return null;
   }

@@ -834,6 +834,7 @@ describe('Dataset', () => {
         retryCount: 0,
         traceId: 'trace-a',
         status: 'reviewed',
+        tags: ['a'],
         organizationId: 'org-1',
         projectId: 'proj-1',
       });
@@ -850,6 +851,7 @@ describe('Dataset', () => {
         retryCount: 0,
         traceId: 'trace-b',
         status: 'needs-review',
+        tags: ['a', 'b'],
         organizationId: 'org-2',
         projectId: 'proj-2',
       });
@@ -887,6 +889,15 @@ describe('Dataset', () => {
       const { results } = await ds.listExperimentResults({ experimentId, status: 'reviewed' });
       expect(results).toHaveLength(1);
       expect(results[0]!.status).toBe('reviewed');
+    });
+
+    it('filters by tags (all must match)', async () => {
+      const both = await ds.listExperimentResults({ experimentId, tags: ['a', 'b'] });
+      expect(both.results.map(r => r.itemId)).toEqual(['item-2']);
+      expect(both.pagination.total).toBe(1);
+
+      const onlyA = await ds.listExperimentResults({ experimentId, tags: ['a'] });
+      expect(onlyA.results.map(r => r.itemId)).toEqual(['item-1', 'item-2']);
     });
 
     it('forwards tenancy filters', async () => {
@@ -1091,5 +1102,25 @@ describe('Dataset', () => {
     ).rejects.toMatchObject({
       id: 'EXPERIMENT_RESULT_MISSING_EXPERIMENT_ID',
     });
+  });
+
+  it('validates each schema update against the newly proposed schema', async () => {
+    await ds.addItem({ input: { a: 1 } });
+    const numberSchema = { type: 'object', properties: { a: { type: 'number' } }, required: ['a'] };
+    await ds.update({ inputSchema: numberSchema });
+
+    const stringSchema = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] };
+    await expect(ds.update({ inputSchema: stringSchema })).rejects.toBeInstanceOf(SchemaUpdateValidationError);
+  });
+
+  it('drops the cached validator when the schema of an empty dataset changes', async () => {
+    const stringSchema = { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] };
+    await ds.update({ inputSchema: stringSchema });
+    await ds.addItem({ input: { a: 'x' } });
+    await ds.deleteItem({ itemId: (await ds.listItems()).items[0]!.id });
+
+    const numberSchema = { type: 'object', properties: { a: { type: 'number' } }, required: ['a'] };
+    await ds.update({ inputSchema: numberSchema });
+    await expect(ds.addItem({ input: { a: 1 } })).resolves.toBeDefined();
   });
 });

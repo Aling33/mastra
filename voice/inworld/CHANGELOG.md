@@ -1,5 +1,49 @@
 # @mastra/voice-inworld
 
+## 0.4.4
+
+### Patch Changes
+
+- Tools that return nothing no longer produce an invalid `function_call_output`. The result is now serialised as `null` instead of being dropped, so the item always carries the required `output` string, matching the xAI realtime provider. The same fix is applied to the Inworld realtime provider, which uses the same `function_call_output` shape. Fixes [#26505](https://github.com/mastra-ai/mastra/issues/26505). ([#26624](https://github.com/mastra-ai/mastra/pull/26624))
+
+## 0.4.4-alpha.0
+
+### Patch Changes
+
+- Tools that return nothing no longer produce an invalid `function_call_output`. The result is now serialised as `null` instead of being dropped, so the item always carries the required `output` string, matching the xAI realtime provider. The same fix is applied to the Inworld realtime provider, which uses the same `function_call_output` shape. Fixes [#26505](https://github.com/mastra-ai/mastra/issues/26505). ([#26624](https://github.com/mastra-ai/mastra/pull/26624))
+
+## 0.4.3
+
+### Patch Changes
+
+- Fixed a WebSocket denial-of-service advisory by updating ws to 8.21.3. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 0.4.3-alpha.0
+
+### Patch Changes
+
+- Fixed a WebSocket denial-of-service advisory by updating ws to 8.21.3. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 0.4.2
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.4.2-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 0.4.2-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
 ## 0.4.1
 
 ### Patch Changes

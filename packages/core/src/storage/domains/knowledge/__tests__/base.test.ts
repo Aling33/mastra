@@ -1,7 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
 import { InMemoryDB } from '../../inmemory-db';
-import { createKnowledgeUlid, KnowledgeConflictError } from '../base';
+import {
+  assertKnowledgeSchemaCompatible,
+  createKnowledgeUlid,
+  inspectKnowledgeSchema,
+  KnowledgeConflictError,
+  KnowledgeSchemaResetRequiredError,
+  KnowledgeStorage,
+  KnowledgeUnsupportedCapabilityError,
+  KNOWLEDGE_STORAGE_CONTRACT_VERSION,
+  KNOWLEDGE_STORAGE_SCHEMA_VERSION,
+  MAX_KNOWLEDGE_RECORD_TEXT_LENGTH,
+} from '../base';
 import { InMemoryKnowledgeStorage } from '../inmemory';
 
 const org = ['org:acme'];
@@ -19,6 +30,247 @@ describe('InMemoryKnowledgeStorage', () => {
     const second = createKnowledgeUlid(1);
 
     expect(second > first).toBe(true);
+  });
+
+  it('rejects record text over the length bound without writing it', async () => {
+    const store = createStore();
+    const node = await store.createNode({ name: 'Bounded', kind: 'service', scope: resource });
+    const append = (text: string) =>
+      store.appendKnowledge({
+        node,
+        text,
+        scope: resource,
+        sourceThreadId: 't1',
+        resolutionScope: thread,
+        defaultScope: resource,
+      });
+
+    await append('x'.repeat(MAX_KNOWLEDGE_RECORD_TEXT_LENGTH));
+    await expect(append('x'.repeat(MAX_KNOWLEDGE_RECORD_TEXT_LENGTH + 1))).rejects.toThrow(
+      'split it into separate facts or summarize it',
+    );
+    expect((await store.listKnowledgeAbout({ node, scope: resource })).records).toHaveLength(1);
+  });
+
+  it('places an existing node when a write names it again with scope addresses', async () => {
+    const store = createStore();
+    const { scopes } = await store.reconcileStructure({ scopes: [{ address: 'features', name: 'features' }] });
+    const existing = await store.createNode({ name: 'Deploy', kind: 'doc', scope: resource });
+
+    const placed = await store.createNode({
+      name: 'deploy',
+      kind: 'doc',
+      scope: resource,
+      scopeAddresses: ['features'],
+    });
+
+    expect(placed.id).toBe(existing.id);
+    expect((await store.listScopeMembers({ scopeNodeId: scopes['features']! })).members).toEqual([
+      expect.objectContaining({ id: existing.id }),
+    ]);
+    await expect(
+      store.createNode({ name: 'Deploy', kind: 'doc', scope: resource, scopeAddresses: ['missing'] }),
+    ).rejects.toThrow(/scope/i);
+  });
+
+  it('lists reconciled scope nodes with parent membership edges', async () => {
+    const store = createStore();
+    const plan = {
+      scopes: [
+        { address: 'org:acme', name: 'mastra' },
+        { address: 'features', name: 'features', kind: 'domain', parentAddresses: ['org:acme'] },
+        { address: 'features:memory', name: 'memory', description: 'Memory scope', parentAddresses: ['features'] },
+      ],
+    };
+    const { scopes } = await store.reconcileStructure(plan);
+
+    const { scopes: nodes, nextCursor } = await store.listScopeNodes();
+    expect(nextCursor).toBeNull();
+    expect(nodes.map(node => node.name)).toEqual(['features', 'mastra', 'memory']);
+    const features = nodes.find(node => node.name === 'features')!;
+    const mastra = nodes.find(node => node.name === 'mastra')!;
+    const memory = nodes.find(node => node.name === 'memory')!;
+    expect(features).toMatchObject({ address: 'features', kind: 'domain', parentIds: [mastra.id] });
+    expect(memory).toMatchObject({ address: 'features:memory', description: 'Memory scope', parentIds: [features.id] });
+    expect(mastra).toMatchObject({ address: 'org:acme', parentIds: [] });
+    expect(Object.values(scopes)).toEqual(expect.arrayContaining([features.id, mastra.id, memory.id]));
+
+    // Child scopes are members of their parent, as in the persistent adapters.
+    const { members, hasMore, nextCursor: memberCursor } = await store.listScopeMembers({ scopeNodeId: mastra.id });
+    expect(hasMore).toBe(false);
+    expect(memberCursor).toBeNull();
+    expect(members).toEqual([
+      expect.objectContaining({ id: features.id, type: 'node', name: 'features', kind: 'domain', scope: null }),
+    ]);
+    await expect(store.listScopeMembers({ scopeNodeId: features.id })).resolves.toEqual({
+      members: [expect.objectContaining({ id: memory.id, name: 'memory', kind: '', description: 'Memory scope' })],
+      hasMore: false,
+      nextCursor: null,
+    });
+    await expect(store.listScopeMembers({ scopeNodeId: memory.id })).resolves.toEqual({
+      members: [],
+      hasMore: false,
+      nextCursor: null,
+    });
+    await expect(store.listScopeMembers({ scopeNodeId: crypto.randomUUID() })).resolves.toEqual({
+      members: [],
+      hasMore: false,
+      nextCursor: null,
+    });
+
+    // A scope with more members than the limit reports the overflow instead of silently dropping it.
+    await store.reconcileStructure({
+      ...plan,
+      scopes: [...plan.scopes, { address: 'docs', name: 'docs', parentAddresses: ['org:acme'] }],
+    });
+    const firstPage = await store.listScopeMembers({ scopeNodeId: mastra.id, limit: 1 });
+    expect(firstPage.members).toHaveLength(1);
+    expect(firstPage.hasMore).toBe(true);
+    // The cursor continues where the first page stopped, so every member is read exactly once.
+    const secondPage = await store.listScopeMembers({
+      scopeNodeId: mastra.id,
+      limit: 1,
+      cursor: firstPage.nextCursor!,
+    });
+    expect(secondPage).toMatchObject({ hasMore: false, nextCursor: null });
+    expect([...firstPage.members, ...secondPage.members].map(member => member.name).sort()).toEqual([
+      'docs',
+      'features',
+    ]);
+    await expect(store.listScopeMembers({ scopeNodeId: features.id, cursor: firstPage.nextCursor! })).rejects.toThrow(
+      'Knowledge scope member cursor does not match this query.',
+    );
+    await expect(store.listScopeMembers({ scopeNodeId: mastra.id, limit: 2 })).resolves.toMatchObject({
+      hasMore: false,
+    });
+  });
+
+  it('filters scope nodes to one subtree or exact addresses and pages them by name', async () => {
+    const store = createStore();
+    const { scopes: ids } = await store.reconcileStructure({
+      scopes: [
+        { address: 'org:acme', name: 'Acme' },
+        { address: 'team:a', name: 'A', parentAddresses: ['org:acme'] },
+        { address: 'team:b', name: 'B', parentAddresses: ['org:acme'] },
+        { address: 'project:p', name: 'P', parentAddresses: ['team:a', 'team:b'] },
+        { address: 'org:other', name: 'Other' },
+        { address: 'team:o', name: 'O', parentAddresses: ['org:other'] },
+      ],
+    });
+
+    const within = await store.listScopeNodes({ withinAddress: 'org:acme' });
+    expect(within.scopes.map(scope => scope.address)).toEqual(['team:a', 'org:acme', 'team:b', 'project:p']);
+    expect(within.nextCursor).toBeNull();
+    expect(within.scopes.find(scope => scope.address === 'project:p')?.parentIds.sort()).toEqual(
+      [ids['team:a'], ids['team:b']].sort(),
+    );
+
+    expect(await store.listScopeNodes({ withinAddress: 'org:acme', limit: Number.NaN })).toEqual(within);
+    const first = await store.listScopeNodes({ withinAddress: 'org:acme', limit: 3 });
+    expect(first.scopes).toHaveLength(3);
+    expect(first.nextCursor).toEqual(expect.any(String));
+    const second = await store.listScopeNodes({ withinAddress: 'org:acme', limit: 3, cursor: first.nextCursor! });
+    expect([...first.scopes, ...second.scopes]).toEqual(within.scopes);
+    expect(second.nextCursor).toBeNull();
+    await expect(store.listScopeNodes({ withinAddress: 'org:other', cursor: first.nextCursor! })).rejects.toThrow(
+      'does not match this query',
+    );
+
+    expect((await store.listScopeNodes({ withinAddress: 'team:b' })).scopes.map(scope => scope.address)).toEqual([
+      'team:b',
+      'project:p',
+    ]);
+    expect((await store.listScopeNodes({ addresses: ['team:o', 'missing'] })).scopes.map(scope => scope.id)).toEqual([
+      ids['team:o'],
+    ]);
+    expect(await store.listScopeNodes({ withinAddress: 'missing' })).toEqual({ scopes: [], nextCursor: null });
+  });
+
+  it('throws a typed capability error for adapters without the structural scope read', async () => {
+    const bare = {} as KnowledgeStorage;
+    await expect(KnowledgeStorage.prototype.listScopeNodes.call(bare)).rejects.toBeInstanceOf(
+      KnowledgeUnsupportedCapabilityError,
+    );
+    await expect(
+      KnowledgeStorage.prototype.listScopeMembers.call(bare, { scopeNodeId: crypto.randomUUID() }),
+    ).rejects.toBeInstanceOf(KnowledgeUnsupportedCapabilityError);
+  });
+
+  it('reports the v2 contract and inspects schema without mutating Knowledge data', async () => {
+    const store = createStore();
+    const node = await store.createNode({ name: 'Keep me', kind: 'topic', scope: resource });
+
+    expect(store.getCapabilities()).toEqual({
+      contractVersion: KNOWLEDGE_STORAGE_CONTRACT_VERSION,
+      schemaVersion: KNOWLEDGE_STORAGE_SCHEMA_VERSION,
+      supportsV2: true,
+      supportsSchemaInspection: true,
+      supportsExplicitReset: true,
+    });
+    expect(await store.inspectSchema()).toEqual({
+      status: 'compatible',
+      schemaVersion: KNOWLEDGE_STORAGE_SCHEMA_VERSION,
+    });
+    expect(await store.getNode(node.id)).toEqual(node);
+  });
+
+  it('classifies incompatible schema snapshots without mutating probe results', () => {
+    const tableNames = Object.freeze(['mastra_knowledge_nodes', 'mastra_knowledge_records']);
+    const snapshot = Object.freeze({
+      available: true,
+      tableNames,
+      schemaVersion: 1,
+      reason: 'experimental v1 columns detected',
+    });
+
+    const inspection = inspectKnowledgeSchema(snapshot);
+
+    expect(inspection).toEqual({
+      status: 'incompatible-reset-required',
+      schemaVersion: 1,
+      reason: 'experimental v1 columns detected',
+    });
+    expect(snapshot.tableNames).toBe(tableNames);
+    expect(() => assertKnowledgeSchemaCompatible(inspection)).toThrow(KnowledgeSchemaResetRequiredError);
+    expect(() => assertKnowledgeSchemaCompatible(inspection)).toThrow(
+      'Knowledge schema reset required: experimental v1 columns detected. Existing Knowledge data is not migrated. To replace it, call `await storage.stores?.knowledge?.dangerouslyReset()`, which deletes every Knowledge row and nothing else.',
+    );
+    expect(inspectKnowledgeSchema({ available: true, tableNames: [] })).toEqual({
+      status: 'uninitialized',
+      schemaVersion: null,
+    });
+    expect(
+      inspectKnowledgeSchema({
+        available: true,
+        tableNames: ['mastra_knowledge_nodes'],
+        schemaVersion: KNOWLEDGE_STORAGE_SCHEMA_VERSION,
+      }),
+    ).toEqual({ status: 'compatible', schemaVersion: KNOWLEDGE_STORAGE_SCHEMA_VERSION });
+    expect(inspectKnowledgeSchema({ available: false, tableNames: [], reason: 'adapter offline' })).toEqual({
+      status: 'unavailable',
+      schemaVersion: null,
+      reason: 'adapter offline',
+    });
+    expect(() => assertKnowledgeSchemaCompatible({ status: 'uninitialized', schemaVersion: null })).not.toThrow();
+  });
+
+  it('resets only Knowledge-owned state', async () => {
+    const db = new InMemoryDB();
+    const store = new InMemoryKnowledgeStorage({ db });
+    const now = new Date();
+    db.threads.set('thread-1', { id: 'thread-1', resourceId: 'resource-1', createdAt: now, updatedAt: now });
+    const node = await store.createNode({ name: 'Reset me', kind: 'topic', scope: resource });
+
+    await store.dangerouslyReset();
+
+    expect(await store.getNode(node.id)).toBeNull();
+    expect(db.knowledgeNodeKeys.size).toBe(0);
+    expect(db.knowledgeRecords.size).toBe(0);
+    expect(db.knowledgeMentions.size).toBe(0);
+    expect(db.knowledgeActivity).toHaveLength(0);
+    expect(db.knowledgeSemanticOutbox.size).toBe(0);
+    expect(db.knowledgeSemanticIdempotency.size).toBe(0);
+    expect(db.threads.has('thread-1')).toBe(true);
   });
 
   it('stores identity and optional content on one node type', async () => {
@@ -120,7 +372,10 @@ describe('InMemoryKnowledgeStorage', () => {
     searchResult.scope.push('thread:mutated');
     expect((await store.search({ query: 'clone', scope: resource }))[0]?.scope).toEqual(resource);
 
-    const now = new Date('2026-08-20T00:00:00.000Z');
+    // Anchor to real time: pending outbox rows become available at insertion
+    // time, so a fixed historical claim date would find nothing to claim.
+    const now = new Date();
+    const claimTime = new Date(now);
     const [claimed] = await store.claimSemanticOutbox({ workerId: 'worker', now, limit: 1 });
     now.setUTCFullYear(2030);
     claimed!.scope.push('thread:mutated');
@@ -131,16 +386,15 @@ describe('InMemoryKnowledgeStorage', () => {
       expect.objectContaining({
         documentType: 'node',
         scope: resource,
-        claimedAt: new Date('2026-08-20T00:00:00.000Z'),
+        claimedAt: claimTime,
       }),
     );
 
-    const retryAt = new Date('2026-08-21T00:00:00.000Z');
+    const retryAt = new Date(claimTime.getTime() + 24 * 60 * 60 * 1000);
+    const retryTime = new Date(retryAt);
     await store.releaseSemanticOutbox({ ids: [claimed!.id], workerId: 'worker', retryAt });
     retryAt.setUTCFullYear(2030);
-    expect((await store.listSemanticOutbox({ status: 'pending' }))[0]?.availableAt).toEqual(
-      new Date('2026-08-21T00:00:00.000Z'),
-    );
+    expect((await store.listSemanticOutbox({ status: 'pending' }))[0]?.availableAt).toEqual(retryTime);
   });
 
   it('resolves names from narrow to broad scope without crossing siblings', async () => {
@@ -155,6 +409,16 @@ describe('InMemoryKnowledgeStorage', () => {
     expect(siblingOnly.scope).toEqual(sibling);
   });
 
+  it('resolves a name through a sibling-scoped node merged into a visible node', async () => {
+    const store = createStore();
+    const alias = await store.createNode({ name: 'Janey', kind: 'person', scope: sibling });
+    const jane = await store.createNode({ name: 'Jane', kind: 'person', scope: resource });
+    await store.mergeNodes({ sourceId: alias.id, targetId: jane.id, sourceVersion: alias.version });
+
+    // The alias itself is outside the caller's scope, but its merge terminal is visible.
+    expect((await store.resolveNode({ name: 'Janey', scope: thread }))?.id).toBe(jane.id);
+  });
+
   it('stamps provenance, derives mentions, and separates knowledge about from touching', async () => {
     const store = createStore();
     const jane = await store.createNode({ name: 'Jane', kind: 'person', scope: resource });
@@ -164,7 +428,6 @@ describe('InMemoryKnowledgeStorage', () => {
       scope: thread,
       sourceThreadId: 't1',
       when: new Date('2026-07-01'),
-      maxScope: 'resource',
       resolutionScope: thread,
       defaultScope: resource,
     });
@@ -184,7 +447,7 @@ describe('InMemoryKnowledgeStorage', () => {
   it('applies record visibility independently from node scope', async () => {
     const store = createStore();
     const node = await store.createNode({ name: 'Resource Secret', kind: 'task', scope: resource });
-    await store.appendKnowledge({
+    const record = await store.appendKnowledge({
       node: node.id,
       text: 'org-visible wording',
       scope: org,
@@ -195,7 +458,7 @@ describe('InMemoryKnowledgeStorage', () => {
 
     expect((await store.listKnowledgeAbout({ node, scope: org })).records).toHaveLength(1);
     expect(await store.search({ query: 'org-visible', scope: org })).toEqual([
-      expect.objectContaining({ type: 'record', recordId: node.id, scope: org }),
+      expect.objectContaining({ type: 'record', recordId: record.id, name: '(private node)', scope: org }),
     ]);
     expect((await store.listKnowledgeAbout({ node, scope: thread })).records).toHaveLength(1);
   });
@@ -263,7 +526,6 @@ describe('InMemoryKnowledgeStorage', () => {
       sourceThreadId: 't1',
       resolutionScope: thread,
       defaultScope: resource,
-      maxScope: 'org',
     });
     const beforeMerge = (await store.listSemanticOutbox()).length;
 
@@ -293,34 +555,38 @@ describe('InMemoryKnowledgeStorage', () => {
     expect(await store.claimSemanticOutbox({ workerId: 'second', limit: 10 })).toHaveLength(1);
   });
 
-  it('enforces ceilings and monotonic curation cursors', async () => {
-    const store = createStore();
-    const node = await store.createNode({ name: 'Secret', kind: 'task', scope: resource });
-    const record = await store.appendKnowledge({
-      node: node.id,
-      text: 'Private detail',
-      scope: resource,
-      sourceThreadId: 't1',
-      maxScope: 'resource',
-      resolutionScope: thread,
-      defaultScope: resource,
-    });
-
-    await expect(store.rescopeKnowledge({ id: record.id, scope: org })).rejects.toThrow('ceiling');
-    await store.raiseKnowledgeCeiling({ id: record.id, maxScope: 'org' });
-    await expect(store.raiseKnowledgeCeiling({ id: record.id, maxScope: 'resource' })).rejects.toThrow('lowered');
-    await expect(store.rescopeKnowledge({ id: record.id, scope: org })).resolves.toEqual(
-      expect.objectContaining({ scope: org }),
+  it('rejects the deprecated curation cursor methods', async () => {
+    const store = new InMemoryKnowledgeStorage({ db: new InMemoryDB() });
+    await expect(store.getCurationCursor({ sourceThreadId: 't1', agent: 'curate' })).rejects.toThrow(
+      'Knowledge curation cursors were removed',
     );
-
-    await store.advanceCurationCursor({ sourceThreadId: 't1', agent: 'curate', lastKnowledgeId: record.id });
     await expect(
       store.advanceCurationCursor({
         sourceThreadId: 't1',
         agent: 'curate',
-        lastKnowledgeId: '00000000000000000000000000',
+        lastKnowledgeId: '01J00000000000000000000000',
       }),
-    ).rejects.toThrow('cannot move backwards');
+    ).rejects.toThrow('Knowledge curation cursors were removed');
+  });
+
+  it('writes and rescopes records to broader scopes without a ceiling', async () => {
+    const store = createStore();
+    const node = await store.createNode({ name: 'Team practice', kind: 'task', scope: org });
+    const record = await store.appendKnowledge({
+      node: node.id,
+      text: 'Reviews happen on Tuesdays',
+      scope: org,
+      sourceThreadId: 't1',
+      resolutionScope: thread,
+      defaultScope: resource,
+    });
+    expect(record.scope).toEqual(org);
+    expect(record).not.toHaveProperty('maxScope');
+
+    await store.rescopeKnowledge({ id: record.id, scope: resource });
+    await expect(store.rescopeKnowledge({ id: record.id, scope: org })).resolves.toEqual(
+      expect.objectContaining({ scope: org }),
+    );
   });
 
   it('paginates knowledge newest-first and supports semantic outbox recovery', async () => {
@@ -415,5 +681,132 @@ describe('InMemoryKnowledgeStorage', () => {
     ]);
     await store.removeKnowledge({ id: record.id, deletedBy: 'curator' });
     expect((await store.search({ query: 'release', scope: thread })).map(result => result.type)).toEqual(['node']);
+  });
+
+  describe('node descriptions', () => {
+    it('creates nodes with and without a description', async () => {
+      const store = createStore();
+      const described = await store.createNode({
+        name: 'Atlas',
+        kind: 'project',
+        description: 'CRM migration project.',
+        scope: resource,
+      });
+      const bare = await store.createNode({ name: 'Bare', kind: 'topic', scope: resource });
+
+      expect(described.description).toBe('CRM migration project.');
+      expect((await store.getNode(described.id))?.description).toBe('CRM migration project.');
+      expect(bare.description).toBeUndefined();
+      expect((await store.getNode(bare.id))?.description).toBeUndefined();
+    });
+
+    it('updates set, preserve, and clear the description independently of content', async () => {
+      const store = createStore();
+      const node = await store.createNode({
+        name: 'Atlas',
+        kind: 'project',
+        content: 'Long-form content stays put.',
+        scope: resource,
+      });
+
+      const set = await store.updateNode({ id: node.id, version: node.version, description: 'Synopsis.' });
+      expect(set.description).toBe('Synopsis.');
+      expect(set.content).toBe('Long-form content stays put.');
+
+      const contentOnly = await store.updateNode({ id: node.id, version: set.version, content: 'New content.' });
+      expect(contentOnly.description).toBe('Synopsis.');
+      expect(contentOnly.content).toBe('New content.');
+
+      const cleared = await store.updateNode({ id: node.id, version: contentOnly.version, description: '' });
+      expect(cleared.description).toBe('');
+      expect(cleared.content).toBe('New content.');
+    });
+
+    it('rejects stale-version description updates', async () => {
+      const store = createStore();
+      const node = await store.createNode({ name: 'Atlas', kind: 'project', scope: resource });
+      await store.updateNode({ id: node.id, version: node.version, description: 'First.' });
+
+      await expect(store.updateNode({ id: node.id, version: node.version, description: 'Stale.' })).rejects.toThrow(
+        KnowledgeConflictError,
+      );
+      expect((await store.getNode(node.id))?.description).toBe('First.');
+    });
+
+    it('applies the merge matrix for descriptions', async () => {
+      const store = createStore();
+
+      // target has description => target wins
+      const t1 = await store.createNode({
+        name: 'T1',
+        kind: 'topic',
+        description: 'Target synopsis.',
+        scope: resource,
+      });
+      const s1 = await store.createNode({
+        name: 'S1',
+        kind: 'topic',
+        description: 'Source synopsis.',
+        scope: resource,
+      });
+      const m1 = await store.mergeNodes({ sourceId: s1.id, targetId: t1.id, sourceVersion: s1.version });
+      expect(m1.description).toBe('Target synopsis.');
+      expect(m1.version).toBe(t1.version);
+
+      // target absent + source present => adopt source's, bump target version
+      const t2 = await store.createNode({ name: 'T2', kind: 'topic', scope: resource });
+      const s2 = await store.createNode({ name: 'S2', kind: 'topic', description: 'Only synopsis.', scope: resource });
+      const outboxBefore = (await store.listSemanticOutbox()).length;
+      const m2 = await store.mergeNodes({ sourceId: s2.id, targetId: t2.id, sourceVersion: s2.version });
+      expect(m2.description).toBe('Only synopsis.');
+      expect(m2.version).toBe(t2.version + 1);
+      expect((await store.getNode(t2.id))?.description).toBe('Only synopsis.');
+      const mergeEntries = (await store.listSemanticOutbox()).slice(outboxBefore);
+      expect(mergeEntries.some(entry => entry.documentId.includes(t2.id) && entry.operation === 'upsert')).toBe(true);
+
+      // both absent => stays absent
+      const t3 = await store.createNode({ name: 'T3', kind: 'topic', scope: resource });
+      const s3 = await store.createNode({ name: 'S3', kind: 'topic', scope: resource });
+      const m3 = await store.mergeNodes({ sourceId: s3.id, targetId: t3.id, sourceVersion: s3.version });
+      expect(m3.description).toBeUndefined();
+      expect(m3.version).toBe(t3.version);
+
+      // target explicitly cleared ('') => the clear wins; source synopsis is not resurrected
+      const t4Seed = await store.createNode({ name: 'T4', kind: 'topic', description: 'Stale.', scope: resource });
+      const t4 = await store.updateNode({ id: t4Seed.id, version: t4Seed.version, description: '' });
+      const s4 = await store.createNode({ name: 'S4', kind: 'topic', description: 'Resurrected.', scope: resource });
+      const m4 = await store.mergeNodes({ sourceId: s4.id, targetId: t4.id, sourceVersion: s4.version });
+      expect(m4.description).toBe('');
+      expect(m4.version).toBe(t4.version);
+    });
+
+    it('matches descriptions in lexical search and includes them in result text when present', async () => {
+      const store = createStore();
+      const described = await store.createNode({
+        name: 'Atlas',
+        kind: 'project',
+        content: 'Runbook body.',
+        description: 'Zephyr-class synopsis.',
+        scope: resource,
+      });
+      await store.createNode({ name: 'Bareword', kind: 'topic', content: 'plain body', scope: resource });
+
+      const byDescription = await store.search({ query: 'zephyr', scope: resource });
+      expect(byDescription).toEqual([
+        expect.objectContaining({ id: described.id, text: 'Atlas\nZephyr-class synopsis.\nRunbook body.' }),
+      ]);
+
+      // description-less result text is byte-identical to the pre-description format
+      const bareResult = (await store.search({ query: 'bareword', scope: resource }))[0]!;
+      expect(bareResult.text).toBe('Bareword\nplain body');
+    });
+
+    it('round-trips old nodes without a description as undefined', async () => {
+      const store = createStore();
+      const node = await store.createNode({ name: 'Legacy', kind: 'topic', content: 'body', scope: resource });
+      const updated = await store.updateNode({ id: node.id, version: node.version, content: 'body 2' });
+      expect(updated.description).toBeUndefined();
+      expect((await store.getNode(node.id))?.description).toBeUndefined();
+    });
   });
 });

@@ -1,6 +1,6 @@
 ---
 title: "Migration: VNext to standard APIs | Migration Guide"
-description: "Learn how to migrate from VNext methods to the new standard agent APIs in Mastra."
+description: "Migrate from VNext methods to Mastra's standard agent generation and streaming APIs, including renamed options, result types, and compatibility changes."
 packages:
   - "@mastra/core"
 ---
@@ -153,7 +153,7 @@ The following options are available in the standard `.stream()` and `generate()`
   - `errorStrategy` - Determines what happens when the output doesn’t match the schema:
 
     - 'warn' - log a warning
-    - 'error' - throw an error
+    - 'strict' - throw an error
     - 'fallback' - return a fallback value you provide
 
     ```typescript

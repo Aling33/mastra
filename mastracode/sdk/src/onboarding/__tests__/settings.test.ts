@@ -1,18 +1,23 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
+import { resolveExperimentalAgent } from '../../experimental-agent.js';
 import { applyOMDefaultIfUnconfigured, hasExplicitOMConfiguration } from '../om-settings.js';
 import {
   createBrowserFromSettings,
   getCustomProviderId,
   loadSettings,
+  migrateAccountPreferences,
   migrateLegacyVariedPack,
   parseCustomProviders,
   parseThreadSettings,
+  pruneRemovedAccountPreferences,
   parseViewportInput,
   resolveDefaultThinkingLevel,
+  resolveLspSetting,
+  resolveModelDefaults,
   resolveOmRoleModel,
   resolveThreadActiveModelPackId,
   saveSettings,
@@ -29,10 +34,12 @@ function createSettings(overrides?: Partial<GlobalSettings>): GlobalSettings {
       version: 0,
       modePackId: null,
       omPackId: null,
-      quietModePreferenceSelected: true,
     },
     models: {
       activeModelPackId: 'anthropic',
+      modePackOverrides: {},
+      packFallbacks: {},
+      packAccountPreferences: {},
       modeDefaults: {},
       modeThinkingDefaults: {},
       activeOmPackId: null,
@@ -47,7 +54,13 @@ function createSettings(overrides?: Partial<GlobalSettings>): GlobalSettings {
       goalJudgeModel: null,
       goalMaxTurns: null,
     },
-    preferences: { yolo: null, theme: 'auto', thinkingLevel: 'off', quietMode: false, quietModeMaxToolPreviewLines: 2 },
+    preferences: {
+      yolo: null,
+      theme: 'auto',
+      thinkingLevel: 'off',
+      subagentsEnabled: false,
+      previewLines: 2,
+    },
     storage,
     customProviders: [],
     customModelPacks: [
@@ -73,7 +86,15 @@ function createSettings(overrides?: Partial<GlobalSettings>): GlobalSettings {
     },
     shellPassthrough: { mode: 'default' },
     voice: { enabled: false, engine: 'cloud', provider: 'openai', model: 'whisper-1' },
-    signals: { unixSocketPubSub: false, experimentalGithubSignals: false },
+    experimentalAgent: null,
+    backgroundTools: { enabled: false },
+    signals: {
+      unixSocketPubSub: false,
+      experimentalGithubSignals: false,
+      experimentalCrossAgentSignals: false,
+      experimentalScheduleTools: false,
+      githubPollIntervalMs: 300_000,
+    },
     mcp: { claudeCodeGlobal: false, codexGlobal: false },
     observability: { resources: {}, localTracing: false },
     ...overrides,
@@ -201,6 +222,211 @@ function withTempSettingsFile(run: (filePath: string) => void): void {
   }
 }
 
+describe('atomic writes', () => {
+  it('preserves an existing file mode across the rename', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, '{}', { encoding: 'utf-8', mode: 0o600 });
+      chmodSync(filePath, 0o600);
+
+      saveSettings(createSettings(), filePath);
+
+      expect(statSync(filePath).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  it('creates new files owner-only', () => {
+    withTempSettingsFile(filePath => {
+      saveSettings(createSettings(), filePath);
+
+      expect(statSync(filePath).mode & 0o777).toBe(0o600);
+    });
+  });
+});
+
+describe('packFallbacks parsing', () => {
+  it('defaults to an empty map when unset', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, '{}', 'utf-8');
+
+      expect(loadSettings(filePath).models.packFallbacks).toEqual({});
+    });
+  });
+
+  it('round-trips a configured chain through save and load', () => {
+    withTempSettingsFile(filePath => {
+      const settings = createSettings();
+      settings.models.packFallbacks = { anthropic: 'openai', openai: 'github-copilot' };
+      saveSettings(settings, filePath);
+
+      expect(loadSettings(filePath).models.packFallbacks).toEqual({
+        anthropic: 'openai',
+        openai: 'github-copilot',
+      });
+    });
+  });
+
+  it('drops malformed values with the usual parsing tolerance', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          models: { packFallbacks: { anthropic: 'openai', openai: 42, 'github-copilot': '' } },
+        }),
+        'utf-8',
+      );
+
+      expect(loadSettings(filePath).models.packFallbacks).toEqual({ anthropic: 'openai' });
+    });
+  });
+
+  it('drops entries whose source or target pack no longer exists', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          models: {
+            packFallbacks: {
+              anthropic: 'openai',
+              openai: 'no-such-pack',
+              'custom:deleted': 'anthropic',
+              'custom:kept': 'anthropic',
+            },
+          },
+          customModelPacks: [
+            { name: 'kept', models: { build: 'anthropic/claude-sonnet-4-5' }, createdAt: '2026-01-01T00:00:00.000Z' },
+          ],
+        }),
+        'utf-8',
+      );
+
+      expect(loadSettings(filePath).models.packFallbacks).toEqual({
+        anthropic: 'openai',
+        'custom:kept': 'anthropic',
+      });
+    });
+  });
+});
+
+describe('packAccountPreferences parsing', () => {
+  it('defaults to an empty map when unset', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, '{}', 'utf-8');
+
+      expect(loadSettings(filePath).models.packAccountPreferences).toEqual({});
+    });
+  });
+
+  it('round-trips valid per-pack model preferences', () => {
+    withTempSettingsFile(filePath => {
+      const settings = createSettings();
+      settings.models.packAccountPreferences = {
+        anthropic: { 'anthropic/claude-fable-5': 'anthropic:account-a' },
+        'custom:My Pack': { 'openai/gpt-5.4': 'openai-codex:account-b' },
+      };
+      saveSettings(settings, filePath);
+
+      expect(loadSettings(filePath).models.packAccountPreferences).toEqual(settings.models.packAccountPreferences);
+    });
+  });
+
+  it('drops malformed values and bindings for missing packs or models', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          models: {
+            packAccountPreferences: {
+              anthropic: {
+                'anthropic/claude-fable-5': 'anthropic:account-a',
+                'anthropic/not-in-pack': 'anthropic:stale',
+                'anthropic/claude-haiku-4-5': 42,
+              },
+              'custom:My Pack': { 'openai/gpt-5.4': 'openai-codex:account-b' },
+              'custom:deleted': { 'openai/gpt-5.4': 'openai-codex:account-c' },
+              openai: 'not-an-object',
+            },
+          },
+          customModelPacks: [
+            {
+              name: 'My Pack',
+              models: { plan: 'openai/gpt-5.4', build: 'anthropic/claude-sonnet-4-5', fast: 'openai/gpt-5.4-mini' },
+              createdAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+        }),
+        'utf-8',
+      );
+
+      expect(loadSettings(filePath).models.packAccountPreferences).toEqual({
+        anthropic: { 'anthropic/claude-fable-5': 'anthropic:account-a' },
+        'custom:My Pack': { 'openai/gpt-5.4': 'openai-codex:account-b' },
+      });
+    });
+  });
+
+  it('removes deleted account bindings while preserving unrelated preferences', () => {
+    const settings = createSettings();
+    settings.models.packAccountPreferences = {
+      anthropic: {
+        'anthropic/claude-fable-5': 'anthropic:removed',
+        'anthropic/claude-haiku-4-5': 'anthropic:kept',
+      },
+      openai: { 'openai/gpt-5.6-sol': 'openai-codex:removed' },
+    };
+
+    pruneRemovedAccountPreferences(settings, ['anthropic:removed', 'openai-codex:removed']);
+
+    expect(settings.models.packAccountPreferences).toEqual({
+      anthropic: { 'anthropic/claude-haiku-4-5': 'anthropic:kept' },
+    });
+  });
+
+  it('migrates account bindings when re-authentication changes the account id', () => {
+    const settings = createSettings();
+    settings.models.packAccountPreferences = {
+      anthropic: {
+        'anthropic/claude-fable-5': 'anthropic:old',
+        'anthropic/claude-haiku-4-5': 'anthropic:kept',
+      },
+      'custom:Daily': { 'anthropic/claude-fable-5': 'anthropic:old' },
+    };
+
+    migrateAccountPreferences(settings, 'anthropic:old', 'anthropic:new');
+
+    expect(settings.models.packAccountPreferences).toEqual({
+      anthropic: {
+        'anthropic/claude-fable-5': 'anthropic:new',
+        'anthropic/claude-haiku-4-5': 'anthropic:kept',
+      },
+      'custom:Daily': { 'anthropic/claude-fable-5': 'anthropic:new' },
+    });
+  });
+
+  it('keeps a preference for a built-in model override and drops the replaced model', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          models: {
+            modePackOverrides: { anthropic: { fast: 'anthropic/claude-opus-4-6' } },
+            packAccountPreferences: {
+              anthropic: {
+                'anthropic/claude-opus-4-6': 'anthropic:account-a',
+                'anthropic/claude-haiku-4-5': 'anthropic:account-b',
+              },
+            },
+          },
+        }),
+        'utf-8',
+      );
+
+      expect(loadSettings(filePath).models.packAccountPreferences).toEqual({
+        anthropic: { 'anthropic/claude-opus-4-6': 'anthropic:account-a' },
+      });
+    });
+  });
+});
+
 describe('MCP discovery settings parsing', () => {
   it('defaults external MCP discovery to disabled', () => {
     withTempSettingsFile(filePath => {
@@ -291,8 +517,27 @@ describe('customProviders parsing/persistence', () => {
 
       expect(settings.customProviders).toEqual([]);
       expect(settings.preferences.thinkingLevel).toBe('off');
-      expect(settings.preferences.quietModeMaxToolPreviewLines).toBe(2);
+      expect(settings.preferences.subagentsEnabled).toBe(false);
+      expect(settings.preferences.previewLines).toBe(2);
       expect(settings.shellPassthrough).toEqual({ mode: 'default' });
+    });
+  });
+
+  it('parses subagent enablement as an explicit boolean preference', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({ onboarding: {}, models: {}, preferences: { subagentsEnabled: true }, storage: {} }),
+        'utf-8',
+      );
+      expect(loadSettings(filePath).preferences.subagentsEnabled).toBe(true);
+
+      writeFileSync(
+        filePath,
+        JSON.stringify({ onboarding: {}, models: {}, preferences: { subagentsEnabled: 'true' }, storage: {} }),
+        'utf-8',
+      );
+      expect(loadSettings(filePath).preferences.subagentsEnabled).toBe(false);
     });
   });
 
@@ -344,47 +589,63 @@ describe('customProviders parsing/persistence', () => {
     });
   });
 
-  it('normalizes quiet mode preview line limits', () => {
+  it('normalizes preview line limits', () => {
     withTempSettingsFile(filePath => {
-      writeFileSync(
-        filePath,
-        JSON.stringify({ onboarding: {}, models: {}, preferences: { quietModeMaxToolPreviewLines: 2.9 }, storage: {} }),
-        'utf-8',
-      );
-      expect(loadSettings(filePath).preferences.quietModeMaxToolPreviewLines).toBe(2);
+      const load = (preferences: Record<string, unknown>) => {
+        writeFileSync(filePath, JSON.stringify({ onboarding: {}, models: {}, preferences, storage: {} }), 'utf-8');
+        return loadSettings(filePath).preferences.previewLines;
+      };
 
-      writeFileSync(
-        filePath,
-        JSON.stringify({ onboarding: {}, models: {}, preferences: { quietModeMaxToolPreviewLines: -4 }, storage: {} }),
-        'utf-8',
-      );
-      expect(loadSettings(filePath).preferences.quietModeMaxToolPreviewLines).toBe(0);
-
-      writeFileSync(
-        filePath,
-        JSON.stringify({ onboarding: {}, models: {}, preferences: { quietModeMaxToolPreviewLines: 999 }, storage: {} }),
-        'utf-8',
-      );
-      expect(loadSettings(filePath).preferences.quietModeMaxToolPreviewLines).toBe(8);
+      expect(load({ previewLines: 2.9 })).toBe(2);
+      expect(load({ previewLines: -4 })).toBe(0);
+      expect(load({ previewLines: -1 })).toBe(0);
+      expect(load({ previewLines: 999 })).toBe(8);
+      expect(load({ previewLines: 99 })).toBe(8);
+      expect(load({ previewLines: 0 })).toBe(0);
 
       writeFileSync(filePath, '{}', 'utf-8');
       vi.spyOn(JSON, 'parse').mockReturnValueOnce({
-        onboarding: { quietModePreferenceSelected: true },
+        onboarding: {},
         models: {},
-        preferences: { quietModeMaxToolPreviewLines: Number.NaN },
+        preferences: { previewLines: Number.NaN },
         storage: {},
       });
-      expect(loadSettings(filePath).preferences.quietModeMaxToolPreviewLines).toBe(2);
+      expect(loadSettings(filePath).preferences.previewLines).toBe(2);
       vi.mocked(JSON.parse).mockRestore();
 
       vi.spyOn(JSON, 'parse').mockReturnValueOnce({
-        onboarding: { quietModePreferenceSelected: true },
+        onboarding: {},
         models: {},
-        preferences: { quietModeMaxToolPreviewLines: Number.POSITIVE_INFINITY },
+        preferences: { previewLines: Number.POSITIVE_INFINITY },
         storage: {},
       });
-      expect(loadSettings(filePath).preferences.quietModeMaxToolPreviewLines).toBe(2);
+      expect(loadSettings(filePath).preferences.previewLines).toBe(2);
       vi.mocked(JSON.parse).mockRestore();
+    });
+  });
+
+  it('keeps native background tools disabled unless explicitly enabled', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ onboarding: {}, models: {}, preferences: {}, storage: {} }), 'utf-8');
+      expect(loadSettings(filePath).backgroundTools.enabled).toBe(false);
+
+      const settings = createSettings();
+      settings.backgroundTools.enabled = true;
+      saveSettings(settings, filePath);
+      expect(loadSettings(filePath).backgroundTools.enabled).toBe(true);
+
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          onboarding: {},
+          models: {},
+          preferences: {},
+          storage: {},
+          backgroundTools: { enabled: 'yes' },
+        }),
+        'utf-8',
+      );
+      expect(loadSettings(filePath).backgroundTools.enabled).toBe(false);
     });
   });
 
@@ -423,62 +684,307 @@ describe('customProviders parsing/persistence', () => {
     });
   });
 
-  it('defaults new installs to quiet mode with the preference selected', () => {
-    withTempSettingsFile(filePath => {
-      const settings = loadSettings(filePath);
-
-      expect(settings.preferences.quietMode).toBe(true);
-      expect(settings.onboarding.quietModePreferenceSelected).toBe(true);
-    });
-  });
-
-  it('marks existing classic users as needing the quiet mode preference prompt', () => {
-    withTempSettingsFile(filePath => {
-      writeFileSync(
-        filePath,
-        JSON.stringify({ onboarding: {}, models: {}, preferences: { quietMode: false }, storage: {} }),
-        'utf-8',
-      );
-
-      const settings = loadSettings(filePath);
-
-      expect(settings.preferences.quietMode).toBe(false);
-      expect(settings.onboarding.quietModePreferenceSelected).toBe(false);
-    });
-  });
-
-  it('does not prompt existing users who already enabled quiet mode', () => {
-    withTempSettingsFile(filePath => {
-      writeFileSync(
-        filePath,
-        JSON.stringify({ onboarding: {}, models: {}, preferences: { quietMode: true }, storage: {} }),
-        'utf-8',
-      );
-
-      const settings = loadSettings(filePath);
-
-      expect(settings.preferences.quietMode).toBe(true);
-      expect(settings.onboarding.quietModePreferenceSelected).toBe(true);
-    });
-  });
-
-  it('preserves existing quiet mode preference selections', () => {
+  it('persists experimental cross-agent signals and defaults them off for old settings files', () => {
     withTempSettingsFile(filePath => {
       writeFileSync(
         filePath,
         JSON.stringify({
-          onboarding: { quietModePreferenceSelected: true },
+          onboarding: {},
           models: {},
-          preferences: { quietMode: false },
+          preferences: {},
           storage: {},
+          signals: { unixSocketPubSub: true },
+        }),
+        'utf-8',
+      );
+      expect(loadSettings(filePath).signals.experimentalCrossAgentSignals).toBe(false);
+
+      const settings = loadSettings(filePath);
+      settings.signals.experimentalCrossAgentSignals = true;
+      saveSettings(settings, filePath);
+
+      expect(loadSettings(filePath).signals.experimentalCrossAgentSignals).toBe(true);
+      expect(JSON.parse(readFileSync(filePath, 'utf-8')).signals.experimentalCrossAgentSignals).toBe(true);
+    });
+  });
+
+  it('defaults experimental schedule tools off and persists opting in', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ signals: {} }), 'utf-8');
+      expect(loadSettings(filePath).signals.experimentalScheduleTools).toBe(false);
+
+      const settings = loadSettings(filePath);
+      settings.signals.experimentalScheduleTools = true;
+      saveSettings(settings, filePath);
+
+      expect(loadSettings(filePath).signals.experimentalScheduleTools).toBe(true);
+    });
+  });
+
+  it('defaults missing GitHub poll interval for old settings files', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          onboarding: {},
+          models: {},
+          preferences: {},
+          storage: {},
+          signals: { experimentalGithubSignals: true },
         }),
         'utf-8',
       );
 
       const settings = loadSettings(filePath);
 
-      expect(settings.preferences.quietMode).toBe(false);
-      expect(settings.onboarding.quietModePreferenceSelected).toBe(true);
+      expect(settings.signals.experimentalGithubSignals).toBe(true);
+      expect(settings.signals.githubPollIntervalMs).toBe(300_000);
+    });
+  });
+
+  it('falls back for malformed GitHub poll interval values', () => {
+    withTempSettingsFile(filePath => {
+      for (const value of [null, '300000', -1, 9999]) {
+        writeFileSync(
+          filePath,
+          JSON.stringify({
+            onboarding: {},
+            models: {},
+            preferences: {},
+            storage: {},
+            signals: { githubPollIntervalMs: value },
+          }),
+          'utf-8',
+        );
+        expect(loadSettings(filePath).signals.githubPollIntervalMs).toBe(300_000);
+      }
+
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          onboarding: {},
+          models: {},
+          preferences: {},
+          storage: {},
+          signals: { githubPollIntervalMs: 99_999_999_999 },
+        }),
+        'utf-8',
+      );
+      expect(loadSettings(filePath).signals.githubPollIntervalMs).toBe(2_147_483_647);
+    });
+  });
+
+  it('persists GitHub poll interval across reloads', () => {
+    withTempSettingsFile(filePath => {
+      const settings = createSettings();
+      settings.signals.githubPollIntervalMs = 60_000;
+      saveSettings(settings, filePath);
+
+      expect(loadSettings(filePath).signals.githubPollIntervalMs).toBe(60_000);
+      expect(JSON.parse(readFileSync(filePath, 'utf-8')).signals.githubPollIntervalMs).toBe(60_000);
+    });
+  });
+
+  it('does not clobber GitHub poll interval from a stale settings object', () => {
+    withTempSettingsFile(filePath => {
+      saveSettings(createSettings(), filePath);
+      const staleSettings = loadSettings(filePath);
+
+      const currentSettings = loadSettings(filePath);
+      currentSettings.signals.githubPollIntervalMs = 60_000;
+      saveSettings(currentSettings, filePath);
+
+      staleSettings.modelUseCounts['openai/gpt-5.5'] = 1;
+      saveSettings(staleSettings, filePath);
+
+      expect(loadSettings(filePath).signals.githubPollIntervalMs).toBe(60_000);
+      expect(JSON.parse(readFileSync(filePath, 'utf-8')).signals.githubPollIntervalMs).toBe(60_000);
+    });
+  });
+
+  describe('preview lines migration from legacy quiet-mode keys', () => {
+    const LEGACY_PREFERENCES = { quietMode: false, quietModeMaxToolPreviewLines: 4 };
+    const LEGACY_ONBOARDING = { skippedAt: '2026-01-01T00:00:00.000Z', version: 1, quietModePreferenceSelected: true };
+
+    function readFile(filePath: string) {
+      return JSON.parse(readFileSync(filePath, 'utf-8'));
+    }
+
+    it('migrates the legacy preview limit and persists it without touching legacy keys', () => {
+      withTempSettingsFile(filePath => {
+        writeFileSync(
+          filePath,
+          JSON.stringify({ onboarding: LEGACY_ONBOARDING, models: {}, preferences: LEGACY_PREFERENCES, storage: {} }),
+          'utf-8',
+        );
+
+        expect(loadSettings(filePath).preferences.previewLines).toBe(4);
+
+        const persisted = readFile(filePath);
+        expect(persisted.preferences.previewLines).toBe(4);
+        expect(persisted.preferences.quietMode).toBe(false);
+        expect(persisted.preferences.quietModeMaxToolPreviewLines).toBe(4);
+        expect(persisted.onboarding.quietModePreferenceSelected).toBe(true);
+      });
+    });
+
+    it('migrates a legacy quiet mode user the same way and keeps quietMode true', () => {
+      withTempSettingsFile(filePath => {
+        writeFileSync(
+          filePath,
+          JSON.stringify({
+            onboarding: LEGACY_ONBOARDING,
+            models: {},
+            preferences: { quietMode: true, quietModeMaxToolPreviewLines: 8 },
+            storage: {},
+          }),
+          'utf-8',
+        );
+
+        expect(loadSettings(filePath).preferences.previewLines).toBe(8);
+
+        const persisted = readFile(filePath);
+        expect(persisted.preferences.previewLines).toBe(8);
+        expect(persisted.preferences.quietMode).toBe(true);
+        expect(persisted.preferences.quietModeMaxToolPreviewLines).toBe(8);
+      });
+    });
+
+    it('prefers previewLines over the legacy key and leaves the legacy key alone', () => {
+      withTempSettingsFile(filePath => {
+        writeFileSync(
+          filePath,
+          JSON.stringify({
+            onboarding: LEGACY_ONBOARDING,
+            models: {},
+            preferences: { ...LEGACY_PREFERENCES, previewLines: 1 },
+            storage: {},
+          }),
+          'utf-8',
+        );
+
+        expect(loadSettings(filePath).preferences.previewLines).toBe(1);
+        const persisted = readFile(filePath);
+        expect(persisted.preferences.previewLines).toBe(1);
+        expect(persisted.preferences.quietModeMaxToolPreviewLines).toBe(4);
+      });
+    });
+
+    it('falls back to the legacy key when previewLines is invalid and persists the resolved value', () => {
+      withTempSettingsFile(filePath => {
+        writeFileSync(
+          filePath,
+          JSON.stringify({
+            onboarding: {},
+            models: {},
+            preferences: { previewLines: 'x', quietModeMaxToolPreviewLines: 4 },
+            storage: {},
+          }),
+          'utf-8',
+        );
+        expect(loadSettings(filePath).preferences.previewLines).toBe(4);
+        expect(readFile(filePath).preferences.previewLines).toBe(4);
+        expect(readFile(filePath).preferences.quietModeMaxToolPreviewLines).toBe(4);
+
+        writeFileSync(
+          filePath,
+          JSON.stringify({
+            onboarding: {},
+            models: {},
+            preferences: { previewLines: 'x', quietModeMaxToolPreviewLines: 'y' },
+            storage: {},
+          }),
+          'utf-8',
+        );
+        expect(loadSettings(filePath).preferences.previewLines).toBe(2);
+        expect(readFile(filePath).preferences.previewLines).toBe(2);
+        expect(readFile(filePath).preferences.quietModeMaxToolPreviewLines).toBe('y');
+      });
+    });
+
+    it('clamps legacy preview limits when migrating', () => {
+      withTempSettingsFile(filePath => {
+        const migrate = (legacy: unknown) => {
+          writeFileSync(
+            filePath,
+            JSON.stringify({
+              onboarding: {},
+              models: {},
+              preferences: { quietModeMaxToolPreviewLines: legacy },
+              storage: {},
+            }),
+            'utf-8',
+          );
+          const value = loadSettings(filePath).preferences.previewLines;
+          expect(readFile(filePath).preferences.quietModeMaxToolPreviewLines).toEqual(legacy);
+          return value;
+        };
+
+        expect(migrate(99)).toBe(8);
+        expect(migrate(-1)).toBe(0);
+        expect(migrate(3.7)).toBe(3);
+        expect(migrate('x')).toBe(2);
+      });
+    });
+
+    it('preserves all legacy keys across a load/save round-trip', () => {
+      withTempSettingsFile(filePath => {
+        writeFileSync(
+          filePath,
+          JSON.stringify({
+            onboarding: LEGACY_ONBOARDING,
+            models: {},
+            preferences: { ...LEGACY_PREFERENCES, previewLines: 4 },
+            storage: {},
+          }),
+          'utf-8',
+        );
+
+        const settings = loadSettings(filePath);
+        settings.preferences.previewLines = 6;
+        saveSettings(settings, filePath);
+
+        const persisted = readFile(filePath);
+        expect(persisted.preferences.previewLines).toBe(6);
+        expect(persisted.preferences.quietMode).toBe(false);
+        expect(persisted.preferences.quietModeMaxToolPreviewLines).toBe(4);
+        expect(persisted.onboarding.quietModePreferenceSelected).toBe(true);
+      });
+    });
+
+    it('does not add the legacy onboarding key for classic users who never answered the prompt', () => {
+      withTempSettingsFile(filePath => {
+        writeFileSync(
+          filePath,
+          JSON.stringify({ onboarding: {}, models: {}, preferences: { quietMode: false }, storage: {} }),
+          'utf-8',
+        );
+
+        expect(loadSettings(filePath).preferences.previewLines).toBe(2);
+        const persisted = readFile(filePath);
+        expect(persisted.preferences.previewLines).toBe(2);
+        expect(persisted.preferences.quietMode).toBe(false);
+        expect(persisted.onboarding).not.toHaveProperty('quietModePreferenceSelected');
+      });
+    });
+
+    it('returns default preview lines for new installs without writing, and first save has no legacy keys', () => {
+      withTempSettingsFile(filePath => {
+        const settings = loadSettings(filePath);
+
+        expect(settings.preferences.previewLines).toBe(2);
+        expect(settings.preferences).not.toHaveProperty('quietMode');
+        expect(settings.preferences).not.toHaveProperty('quietModeMaxToolPreviewLines');
+        expect(settings.onboarding).not.toHaveProperty('quietModePreferenceSelected');
+        expect(existsSync(filePath)).toBe(false);
+
+        saveSettings(settings, filePath);
+        const persisted = readFile(filePath);
+        expect(persisted.preferences.previewLines).toBe(2);
+        expect(persisted.preferences).not.toHaveProperty('quietMode');
+        expect(persisted.preferences).not.toHaveProperty('quietModeMaxToolPreviewLines');
+        expect(persisted.onboarding).not.toHaveProperty('quietModePreferenceSelected');
+      });
     });
   });
 
@@ -715,6 +1221,60 @@ describe('resolveThreadActiveModelPackId', () => {
     });
 
     expect(resolved).toBeNull();
+  });
+});
+
+describe('resolveModelDefaults', () => {
+  it('layers stored mode overrides over the active built-in pack', () => {
+    const settings = createSettings({
+      models: {
+        ...createSettings().models,
+        activeModelPackId: 'openai',
+        modePackOverrides: { openai: { build: 'openai/gpt-5.4' } },
+      },
+    });
+
+    expect(resolveModelDefaults(settings, builtinPacks)).toEqual({
+      plan: 'openai/gpt-5.5',
+      build: 'openai/gpt-5.4',
+      fast: 'openai/gpt-5.4-mini',
+    });
+  });
+
+  it('does not apply built-in overrides to custom packs', () => {
+    const settings = createSettings({
+      models: {
+        ...createSettings().models,
+        activeModelPackId: 'custom:My Pack',
+        modePackOverrides: { 'custom:My Pack': { build: 'openai/gpt-5.4' } },
+      },
+    });
+
+    expect(resolveModelDefaults(settings, builtinPacks)).toEqual(settings.customModelPacks[0]!.models);
+  });
+
+  it('loads valid pack overrides and drops malformed entries', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mc-settings-'));
+    const path = join(dir, 'settings.json');
+    try {
+      writeFileSync(
+        path,
+        JSON.stringify({
+          models: {
+            modePackOverrides: {
+              openai: { build: 'openai/gpt-5.4', plan: 42 },
+              anthropic: null,
+            },
+          },
+        }),
+      );
+
+      expect(loadSettings(path).models.modePackOverrides).toEqual({
+        openai: { build: 'openai/gpt-5.4' },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1034,5 +1594,159 @@ describe('createBrowserFromSettings — recording tools gating', () => {
     for (const name of RECORDING_TOOL_NAMES) {
       expect(tools[name], `expected tool ${name} to be absent on direct AgentBrowser`).toBeUndefined();
     }
+  });
+});
+
+describe('experimental agent settings', () => {
+  it.each([
+    [{}, null],
+    [{ experimentalAgent: null }, null],
+    [{ experimentalAgent: 'durable' }, 'durable'],
+    [{ experimentalAgent: 'evented' }, 'evented'],
+  ] as const)('loads %j as %s', (raw, expected) => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify(raw), 'utf-8');
+      expect(loadSettings(filePath).experimentalAgent).toBe(expected);
+    });
+  });
+
+  it('round-trips the persisted selection', () => {
+    withTempSettingsFile(filePath => {
+      saveSettings(createSettings({ experimentalAgent: 'evented' }), filePath);
+      expect(loadSettings(filePath).experimentalAgent).toBe('evented');
+    });
+  });
+
+  it('loads invalid persisted values without discarding unrelated settings', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(
+        filePath,
+        JSON.stringify({
+          experimentalAgent: 'default',
+          storage: { backend: 'pg', pg: { connectionString: 'postgresql://localhost/mastracode' } },
+        }),
+        'utf-8',
+      );
+
+      const settings = loadSettings(filePath);
+
+      expect(settings.experimentalAgent).toBe('default');
+      expect(settings.storage).toMatchObject({
+        backend: 'pg',
+        pg: { connectionString: 'postgresql://localhost/mastracode' },
+      });
+      expect(settings._experimentalAgentSettingsPath).toBe(filePath);
+    });
+  });
+
+  it('rejects invalid persisted values when resolving the runtime', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ experimentalAgent: 'default' }), 'utf-8');
+      const settings = loadSettings(filePath);
+
+      expect(() => resolveExperimentalAgent(settings, {})).toThrow(
+        `Invalid "experimentalAgent" setting in ${filePath}: "default". ` +
+          `Remove the "experimentalAgent" key or set it to "durable", "evented", or null.`,
+      );
+    });
+  });
+
+  it('lets a valid environment value override an invalid persisted value', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ experimentalAgent: 'default' }), 'utf-8');
+      const settings = loadSettings(filePath);
+
+      expect(resolveExperimentalAgent(settings, { MASTRACODE_EXPERIMENTAL_AGENT: 'evented' })).toBe('evented');
+    });
+  });
+
+  it.each([
+    ['the loaded settings', (settings: GlobalSettings) => settings],
+    ['a structured clone', (settings: GlobalSettings) => structuredClone(settings)],
+  ] as const)('preserves an invalid persisted value when saving %s', (_label, deriveSettings) => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ experimentalAgent: 'default' }), 'utf-8');
+      const settings = deriveSettings(loadSettings(filePath));
+
+      saveSettings(settings, filePath);
+
+      expect(JSON.parse(readFileSync(filePath, 'utf-8'))).toMatchObject({ experimentalAgent: 'default' });
+      expect(() => resolveExperimentalAgent(loadSettings(filePath), {})).toThrow(
+        `Invalid "experimentalAgent" setting in ${filePath}: "default".`,
+      );
+    });
+  });
+
+  it.each([
+    ['durable', 'durable'],
+    ['off', null],
+  ] as const)('lets an explicit %s selection replace an invalid persisted value', (_label, selection) => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ experimentalAgent: 'default' }), 'utf-8');
+      const settings = loadSettings(filePath);
+
+      settings.experimentalAgent = selection;
+      saveSettings(settings, filePath);
+
+      expect(JSON.parse(readFileSync(filePath, 'utf-8'))).toMatchObject({ experimentalAgent: selection });
+    });
+  });
+});
+
+describe('LSP settings parsing', () => {
+  it('leaves LSP unset when the file has no lsp key', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, '{}', 'utf-8');
+
+      expect(loadSettings(filePath).lsp).toBeUndefined();
+    });
+  });
+
+  it('preserves an explicit opt-out', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ lsp: false }), 'utf-8');
+
+      expect(loadSettings(filePath).lsp).toBe(false);
+    });
+  });
+
+  it('preserves an explicit opt-in', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ lsp: true }), 'utf-8');
+
+      expect(loadSettings(filePath).lsp).toBe(true);
+    });
+  });
+
+  it('preserves a full config object', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ lsp: { maxOpenClients: 2 } }), 'utf-8');
+
+      expect(loadSettings(filePath).lsp).toEqual({ maxOpenClients: 2 });
+    });
+  });
+
+  it('ignores malformed values', () => {
+    withTempSettingsFile(filePath => {
+      writeFileSync(filePath, JSON.stringify({ lsp: 'yes' }), 'utf-8');
+      expect(loadSettings(filePath).lsp).toBeUndefined();
+
+      writeFileSync(filePath, JSON.stringify({ lsp: null }), 'utf-8');
+      expect(loadSettings(filePath).lsp).toBeUndefined();
+    });
+  });
+
+  it('defaults new installs to disabled', () => {
+    withTempSettingsFile(filePath => {
+      expect(loadSettings(filePath).lsp).toBe(false);
+    });
+  });
+
+  it('resolveLspSetting treats absent and false as disabled, true as defaults', () => {
+    expect(resolveLspSetting(undefined)).toBe(false);
+    expect(resolveLspSetting(false)).toBe(false);
+    expect(resolveLspSetting(true)).toEqual({});
+    const config = { maxOpenClients: 3 };
+    expect(resolveLspSetting(config)).toBe(config);
   });
 });

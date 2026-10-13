@@ -83,37 +83,29 @@ export const pruneRenderStateScenario: McE2eScenario = {
 
     let prunedTool: Component | undefined;
     let retainedTool: Component | undefined;
-    const thresholdDeadline = Date.now() + 210_000;
-    while ((tuiState.chatContainer.children.length <= 5000 || !retainedTool) && Date.now() < thresholdDeadline) {
-      prunedTool ??= tuiState.pendingAskUserComponents.get('call_prune_0000');
-      retainedTool ??= tuiState.pendingTools.get('call_prune_1667') as Component | undefined;
+    const thresholdDeadline = Date.now() + 30_000;
+    while ((!prunedTool || !retainedTool) && Date.now() < thresholdDeadline) {
+      prunedTool ??= tuiState.pendingAskUserComponents.get('call_prune_0100');
+      retainedTool ??= tuiState.pendingTools.get('call_prune_0599') as Component | undefined;
       await runtime.sleep(10);
     }
-    prunedTool ??= tuiState.pendingAskUserComponents.get('call_prune_0000');
-    retainedTool ??= tuiState.pendingTools.get('call_prune_1667') as Component | undefined;
     if (!prunedTool || !retainedTool) {
       throw new Error(
-        `Expected oldest and newest streamed tools before pruning; children=${tuiState.chatContainer.children.length}`,
-      );
-    }
-    if (tuiState.chatContainer.children.length <= 5000) {
-      throw new Error(
-        `Expected real tool events to cross 5000 children, received ${tuiState.chatContainer.children.length}`,
+        `Expected oldest and newest streamed tools during active pruning; children=${tuiState.chatContainer.children.length}`,
       );
     }
 
-    await runtime.waitForScreenText(/search_content/, terminal, 15_000);
+    await runtime.waitForScreenText(/▐grep▌/, terminal, 15_000);
     terminal.keyCtrlC();
 
     const pruneDeadline = Date.now() + 15_000;
-    while (tuiState.chatContainer.children.length > 3000 && Date.now() < pruneDeadline) {
+    while (tuiState.chatContainer.children.length > 500 && Date.now() < pruneDeadline) {
       await runtime.sleep(20);
     }
 
     const childCount = tuiState.chatContainer.children.length;
-    if (childCount > 3000) throw new Error(`Expected pruning to retain at most 3000 children, received ${childCount}`);
-    if (childCount < 2900)
-      throw new Error(`Expected pruning to preserve approximately 3000 children, received ${childCount}`);
+    if (childCount > 500) throw new Error(`Expected pruning to stay within 500 children, received ${childCount}`);
+    if (childCount < 250) throw new Error(`Expected pruning to retain at least 250 children, received ${childCount}`);
 
     const prunedReferences = countTrackedReferences(tuiState, prunedTool);
     if (prunedReferences !== 0) {
@@ -122,7 +114,7 @@ export const pruneRenderStateScenario: McE2eScenario = {
     const retainedReferences = countTrackedReferences(tuiState, retainedTool);
     if (retainedReferences === 0) throw new Error('Expected newest tool identity to remain tracked after pruning');
 
-    if (!terminal.serialize().view.includes('search_content')) {
+    if (!terminal.serialize().view.includes('▐grep▌')) {
       throw new Error('Expected newest tool output to remain rendered after pruning');
     }
 

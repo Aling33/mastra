@@ -1,7 +1,6 @@
 import type { AssistantContent, UserContent, CoreMessage } from '@internal/ai-sdk-v4';
 import type { MastraDBMessage } from '../agent/message-list';
-import { MastraFGAPermissions } from '../auth/ee';
-import type { MastraFGAPermissionInput, ActorSignal } from '../auth/ee';
+import type { AgentSignalType } from '../agent/signals';
 import { MastraBase } from '../base';
 import { ErrorDomain, MastraError } from '../error';
 import { ModelRouterEmbeddingModel } from '../llm/model';
@@ -14,8 +13,8 @@ import type {
   InputProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
 } from '../processors';
-import { isProcessorWorkflow } from '../processors';
-import { MessageHistory, WorkingMemory, SemanticRecall } from '../processors/memory';
+import { isProcessorWorkflow, TokenLimiterProcessor } from '../processors';
+import { MemoryInputFilter, MessageHistory, WorkingMemory, SemanticRecall } from '../processors/memory';
 import type { RequestContext } from '../request-context';
 import type {
   MastraCompositeStore,
@@ -24,12 +23,20 @@ import type {
   StorageListThreadsOutput,
   StorageCloneThreadInput,
   StorageCloneThreadOutput,
+  StorageCopyThreadOutput,
 } from '../storage';
 import { augmentWithInit } from '../storage/storageWithInit';
 import type { ToolAction } from '../tools';
 import type { IdGeneratorContext } from '../types';
 import { deepMerge } from '../utils';
 import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '../vector';
+import {
+  advanceMemoryTokenBoundary,
+  getMemoryTokenBoundary,
+  normalizeMessageHistoryConfig,
+} from './message-history-config';
+import { checkThreadFGA } from './thread-fga';
+import type { CheckThreadFGAOptions } from './thread-fga';
 
 import type {
   SharedMemoryConfig,
@@ -125,11 +132,13 @@ export abstract class MastraMemory extends MastraBase {
   embedder?: MastraEmbeddingModel<string>;
   embedderOptions?: MastraEmbeddingOptions;
   protected threadConfig: MemoryConfigInternal = { ...memoryDefaultOptions };
+  private readonly hasExplicitLastMessages: boolean;
   #mastra?: Mastra;
 
   constructor(config: { id?: string; name: string } & SharedMemoryConfig) {
     super({ component: 'MEMORY', name: config.name });
     this.id = config.id ?? config.name ?? 'default-memory';
+    this.hasExplicitLastMessages = config.options?.lastMessages !== undefined;
 
     if (config.options) this.threadConfig = this.getMergedThreadConfig(config.options);
 
@@ -177,9 +186,10 @@ https://mastra.ai/en/docs/memory/semantic-recall`,
       }
       this.vector = config.vector;
 
-      if (!config.embedder) {
+      // An embedder is required only when the application supplies the vectors.
+      if (!config.embedder && !config.vector.isSelfEmbedding) {
         throw new Error(
-          `Semantic recall requires an embedder to be configured.
+          `Semantic recall requires an embedder, or a vector store that generates embeddings itself.
 
 https://mastra.ai/en/docs/memory/semantic-recall`,
         );
@@ -303,13 +313,24 @@ https://mastra.ai/en/docs/memory/overview`,
             values: ['a'],
             ...(this.embedderOptions || {}),
           } as any);
-          return result.embeddings[0]?.length;
+          const dimension = result.embeddings[0]?.length;
+          if (!dimension) {
+            throw new Error('Embedder returned no usable embedding for the dimension probe.');
+          }
+          return dimension;
         } catch (e) {
-          console.warn(
-            `[Mastra Memory] Failed to probe embedder for dimension, falling back to default. ` +
-              `This may cause index name mismatches if the embedder uses non-default dimensions. Error: ${e}`,
+          throw new MastraError(
+            {
+              id: 'MASTRA_MEMORY_GET_EMBEDDING_DIMENSION_FAILED',
+              domain: ErrorDomain.MASTRA_VECTOR,
+              category: 'THIRD_PARTY',
+              text:
+                `Failed to determine the embedder's output dimension. Semantic recall cannot safely select a ` +
+                `vector index until the embedder returns a usable embedding. Check that the embedder is reachable ` +
+                `and correctly configured.`,
+            },
+            e,
           );
-          return undefined;
         }
       })();
     }
@@ -320,11 +341,24 @@ https://mastra.ai/en/docs/memory/overview`,
    * Get the index name for semantic recall embeddings.
    * This is used to ensure consistency between the Memory class and SemanticRecall processor.
    */
+  /**
+   * True when the attached vector store produces the embeddings itself, so this Memory sends it
+   * text. False whenever an embedder is configured, which keeps the client-side path intact.
+   */
+  protected get isSelfEmbedding(): boolean {
+    return !this.embedder && this.vector?.isSelfEmbedding === true;
+  }
+
   protected getEmbeddingIndexName(dimensions?: number): string {
+    const separator = this.vector?.indexSeparator ?? '_';
+    // A self-embedding store picks its own dimension, so this name is keyed on the mode.
+    // The names below belong to indexes of client-supplied vectors.
+    if (this.isSelfEmbedding) {
+      return `memory${separator}messages${separator}selfembed`;
+    }
     const defaultDimensions = 1536;
     const usedDimensions = dimensions ?? defaultDimensions;
     const isDefault = usedDimensions === defaultDimensions;
-    const separator = this.vector?.indexSeparator ?? '_';
     return isDefault ? `memory${separator}messages` : `memory${separator}messages${separator}${usedDimensions}`;
   }
 
@@ -344,12 +378,15 @@ https://mastra.ai/en/docs/memory/overview`,
     const semanticConfig = typeof config?.semanticRecall === 'object' ? config.semanticRecall : undefined;
     const indexConfig = semanticConfig?.indexConfig;
 
-    // Base parameters that all vector stores support
-    const createParams: any = {
-      indexName,
-      dimension: usedDimensions,
-      ...(indexConfig?.metric && { metric: indexConfig.metric }),
-    };
+    // Base parameters that all vector stores support. A self-embedding store derives the
+    // dimension and the metric from its own model configuration.
+    const createParams: any = this.isSelfEmbedding
+      ? { indexName }
+      : {
+          indexName,
+          dimension: usedDimensions,
+          ...(indexConfig?.metric && { metric: indexConfig.metric }),
+        };
 
     // Add PG-specific configuration if provided
     // Only PG vector store will use these parameters
@@ -360,9 +397,11 @@ https://mastra.ai/en/docs/memory/overview`,
       if (indexConfig.hnsw) createParams.indexConfig.hnsw = indexConfig.hnsw;
     }
 
-    // Request btree indexes on metadata fields used for filtering
-    // This avoids sequential scans on large tables when querying by thread_id or resource_id
-    createParams.metadataIndexes = ['thread_id', 'resource_id'];
+    if (!this.isSelfEmbedding) {
+      // Request btree indexes on metadata fields used for filtering
+      // This avoids sequential scans on large tables when querying by thread_id or resource_id
+      createParams.metadataIndexes = ['thread_id', 'resource_id'];
+    }
 
     await this.vector.createIndex(createParams);
     return { indexName };
@@ -380,6 +419,17 @@ https://mastra.ai/en/docs/memory/overview`,
     }
 
     const mergedConfig = deepMerge(this.threadConfig, config || {});
+
+    // A token budget replaces the default count window; an explicit numeric `lastMessages` still applies on top.
+    if (
+      config?.messageHistory !== undefined &&
+      config.lastMessages === undefined &&
+      !this.hasExplicitLastMessages &&
+      this.threadConfig.messageHistory === undefined &&
+      this.threadConfig.lastMessages === memoryDefaultOptions.lastMessages
+    ) {
+      mergedConfig.lastMessages = undefined;
+    }
 
     if (
       typeof config?.workingMemory === 'object' &&
@@ -473,7 +523,10 @@ https://mastra.ai/en/docs/memory/overview`,
     args: StorageListMessagesInput & {
       threadConfig?: MemoryConfigInternal;
       vectorSearchString?: string;
+      /** @deprecated Use hideSignals: [] to include all, or ['reactive', 'system-reminder'] to hide reminders. */
       includeSystemReminders?: boolean;
+      /** true hides all recognized signals, false includes all, or select exact stored types with an array. Overrides includeSystemReminders. */
+      hideSignals?: boolean | AgentSignalType[];
       observabilityContext?: Partial<ObservabilityContext>;
     },
   ): Promise<{
@@ -606,46 +659,8 @@ https://mastra.ai/en/docs/memory/overview`,
    * Static helper to check FGA authorization for thread access.
    * Can be called from HTTP handlers and agent execution paths.
    */
-  static async checkThreadFGA(options: {
-    mastra?: Mastra;
-    user?: Record<string, unknown>;
-    threadId: string;
-    resourceId?: string;
-    requestContext?: RequestContext;
-    permission?: MastraFGAPermissionInput;
-    actor?: ActorSignal;
-  }): Promise<void> {
-    const {
-      mastra,
-      user,
-      threadId,
-      resourceId,
-      requestContext,
-      permission = MastraFGAPermissions.MEMORY_READ,
-      actor,
-    } = options;
-    const fgaProvider = mastra?.getServer()?.fga;
-    if (!fgaProvider) return;
-
-    const { requireFGA } = await import('../auth/ee/fga-check');
-    await requireFGA({
-      fgaProvider,
-      user,
-      resource: { type: 'thread', id: threadId },
-      permission,
-      requestContext,
-      actor,
-      context:
-        resourceId || requestContext
-          ? {
-              resourceId,
-            }
-          : undefined,
-      metadata: {
-        threadId,
-        resourceId,
-      },
-    });
+  static async checkThreadFGA(options: CheckThreadFGAOptions): Promise<void> {
+    return checkThreadFGA(options);
   }
 
   /**
@@ -692,6 +707,27 @@ https://mastra.ai/en/docs/memory/overview`,
   }): Promise<void>;
 
   /**
+   * Whether `mergeWorkingMemory` is available (atomic merge supported by storage).
+   */
+  async supportsAtomicWorkingMemoryMerge(): Promise<boolean> {
+    return false;
+  }
+
+  /**
+   * Atomically deep-merges a partial JSON object into resource-scoped working memory.
+   * Implementations without atomic merge support throw.
+   */
+  async mergeWorkingMemory(_: {
+    threadId: string;
+    resourceId?: string;
+    workingMemory: string | Record<string, unknown>;
+    memoryConfig?: MemoryConfigInternal;
+    observabilityContext?: Partial<ObservabilityContext>;
+  }): Promise<void> {
+    throw new Error(`Atomic working memory merge is not supported by ${this.constructor.name}`);
+  }
+
+  /**
    * @warning experimental! can be removed or changed at any time
    */
   abstract __experimental_updateWorkingMemoryVNext({
@@ -707,6 +743,10 @@ https://mastra.ai/en/docs/memory/overview`,
     searchString?: string;
     memoryConfig?: MemoryConfigInternal;
   }): Promise<{ success: boolean; reason: string }>;
+
+  protected createMemoryTokenCounter(): { countMessage(message: MastraDBMessage): number } | undefined {
+    return undefined;
+  }
 
   /**
    * Get input processors for this memory instance
@@ -725,6 +765,35 @@ https://mastra.ai/en/docs/memory/overview`,
     const memoryContext = context?.get('MastraMemory') as MemoryRequestContext | undefined;
     const runtimeMemoryConfig = memoryContext?.memoryConfig;
     const effectiveConfig = runtimeMemoryConfig ? this.getMergedThreadConfig(runtimeMemoryConfig) : this.threadConfig;
+
+    const lastMessages = normalizeMessageHistoryConfig(effectiveConfig.lastMessages, effectiveConfig.messageHistory);
+
+    // Check if user already manually added MessageHistory
+    const hasMessageHistory = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'message-history');
+
+    // Check if ObservationalMemory is present (via processor or config) - it handles its own message loading and saving
+    const hasObservationalMemory =
+      configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'observational-memory') ||
+      isObservationalMemoryEnabled(effectiveConfig.observationalMemory);
+
+    // MemoryInputFilter trims the request down to the part that stored history does
+    // not already cover. That is only correct when a loader is about to pull stored
+    // history in underneath it: with no loader, the request is the entire context
+    // and trimming it deletes messages the caller meant the model to see.
+    // Semantic recall does not qualify - it adds recalled fragments, not the thread's history.
+    const loadsStoredHistory = hasMessageHistory || hasObservationalMemory || lastMessages.enabled;
+
+    if (memoryStore && loadsStoredHistory) {
+      processors.push(
+        new MemoryInputFilter({
+          storage: memoryStore,
+          // Resolved from the merged config so the flag can be set agent-wide (Memory options)
+          // or per call (memory.options on the request), matching how the other memory options
+          // are resolved. The filter reads config nowhere else.
+          retainFullInput: effectiveConfig.retainFullInput === true,
+        }),
+      );
+    }
 
     // Add working memory input processor if configured
     const isWorkingMemoryEnabled =
@@ -769,13 +838,20 @@ https://mastra.ai/en/docs/memory/overview`,
               'version' in effectiveConfig.workingMemory &&
               effectiveConfig.workingMemory.version === 'vnext',
             templateProvider: this,
+            readOnly:
+              effectiveConfig.readOnly ||
+              (typeof effectiveConfig.workingMemory === 'object' &&
+                effectiveConfig.workingMemory.agentManaged === false),
           }),
         );
       }
     }
 
-    const lastMessages = effectiveConfig.lastMessages;
-    if (lastMessages) {
+    const messageTokenCounter =
+      lastMessages.maxTokens === undefined
+        ? undefined
+        : (this.createMemoryTokenCounter() ?? new TokenLimiterProcessor(lastMessages.maxTokens));
+    if (lastMessages.enabled) {
       if (!memoryStore)
         throw new MastraError({
           category: 'USER',
@@ -784,20 +860,20 @@ https://mastra.ai/en/docs/memory/overview`,
           text: 'Using Mastra Memory message history requires a storage adapter but no attached adapter was detected.',
         });
 
-      // Check if user already manually added MessageHistory
-      const hasMessageHistory = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'message-history');
-
-      // Check if ObservationalMemory is present (via processor or config) - it handles its own message loading and saving
-      const hasObservationalMemory =
-        configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'observational-memory') ||
-        isObservationalMemoryEnabled(effectiveConfig.observationalMemory);
-
       // Skip MessageHistory input processor if ObservationalMemory handles message loading
       if (!hasMessageHistory && !hasObservationalMemory) {
         processors.push(
           new MessageHistory({
             storage: memoryStore,
-            lastMessages: typeof lastMessages === 'number' ? lastMessages : undefined,
+            lastMessages: lastMessages.maxMessages ?? false,
+            tokenLimit:
+              lastMessages.maxTokens === undefined
+                ? undefined
+                : {
+                    maxTokens: lastMessages.maxTokens,
+                    atMaxRemoveTokens: lastMessages.atMaxRemoveTokens!,
+                  },
+            tokenCounter: messageTokenCounter,
           }),
         );
       }
@@ -821,12 +897,14 @@ https://mastra.ai/en/docs/memory/overview`,
           text: 'Using Mastra Memory semantic recall requires a vector adapter but no attached adapter was detected.',
         });
 
-      if (!this.embedder)
+      // A self-embedding store needs no embedder: it takes the text and produces the
+      // vectors itself.
+      if (!this.embedder && !this.vector.isSelfEmbedding)
         throw new MastraError({
           category: 'USER',
           domain: ErrorDomain.MASTRA_VECTOR,
           id: 'SEMANTIC_RECALL_MISSING_EMBEDDER',
-          text: 'Using Mastra Memory semantic recall requires an embedder but no attached embedder was detected.',
+          text: 'Using Mastra Memory semantic recall requires an embedder, or a vector store that generates embeddings itself. Neither was detected.',
         });
 
       // Check if user already manually added SemanticRecall
@@ -851,6 +929,51 @@ https://mastra.ai/en/docs/memory/overview`,
           }),
         );
       }
+    }
+
+    if (
+      lastMessages.enabled &&
+      lastMessages.maxTokens !== undefined &&
+      !isObservationalMemoryEnabled(effectiveConfig.observationalMemory) &&
+      !configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'observational-memory')
+    ) {
+      const maxTokens = lastMessages.maxTokens;
+      const atMaxRemoveTokens = lastMessages.atMaxRemoveTokens!;
+      const limiter = new TokenLimiterProcessor({
+        limit: maxTokens,
+        trimMode: 'memory-only',
+        atMaxRemoveTokens,
+        tokenCounter: messageTokenCounter,
+        onMemoryTrim: async (removed, requestContext) => {
+          const memoryContext = (requestContext ?? context)?.get('MastraMemory') as MemoryRequestContext | undefined;
+          const thread = memoryContext?.thread;
+          const executionConfig = memoryContext?.memoryConfig
+            ? this.getMergedThreadConfig(memoryContext.memoryConfig)
+            : effectiveConfig;
+          if (!thread || executionConfig.readOnly) return;
+          const localMessages = removed.filter(message => message.threadId === thread.id);
+          if (!localMessages.length) return;
+
+          const updated = await memoryStore!.updateThreadMetadata({
+            id: thread.id,
+            resourceId: memoryContext.resourceId,
+            update: latest => {
+              const stored = getMemoryTokenBoundary(latest);
+              const previous =
+                stored?.maxTokens === maxTokens && stored.atMaxRemoveTokens === atMaxRemoveTokens ? stored : undefined;
+              const boundary = advanceMemoryTokenBoundary(previous, localMessages, maxTokens, atMaxRemoveTokens);
+              return boundary === previous ? undefined : { memoryTokenLimiter: boundary };
+            },
+          });
+          if (updated) thread.metadata = updated.metadata;
+        },
+      });
+      processors.push({
+        id: 'memory-token-limiter',
+        name: 'Memory Token Limiter',
+        processInput: args => limiter.processInput(args),
+        processInputStep: args => limiter.processInputStep(args),
+      });
     }
 
     // Return only the auto-generated processors (not the configured ones)
@@ -900,12 +1023,14 @@ https://mastra.ai/en/docs/memory/overview`,
           text: 'Using Mastra Memory semantic recall requires a vector adapter but no attached adapter was detected.',
         });
 
-      if (!this.embedder)
+      // A self-embedding store needs no embedder: it takes the text and produces the
+      // vectors itself.
+      if (!this.embedder && !this.vector.isSelfEmbedding)
         throw new MastraError({
           category: 'USER',
           domain: ErrorDomain.MASTRA_VECTOR,
           id: 'SEMANTIC_RECALL_MISSING_EMBEDDER',
-          text: 'Using Mastra Memory semantic recall requires an embedder but no attached embedder was detected.',
+          text: 'Using Mastra Memory semantic recall requires an embedder, or a vector store that generates embeddings itself. Neither was detected.',
         });
 
       // Check if user already manually added SemanticRecall
@@ -933,8 +1058,8 @@ https://mastra.ai/en/docs/memory/overview`,
       }
     }
 
-    const lastMessages = effectiveConfig.lastMessages;
-    if (lastMessages) {
+    const lastMessages = normalizeMessageHistoryConfig(effectiveConfig.lastMessages, effectiveConfig.messageHistory);
+    if (lastMessages.enabled) {
       if (!memoryStore)
         throw new MastraError({
           category: 'USER',
@@ -956,7 +1081,14 @@ https://mastra.ai/en/docs/memory/overview`,
         processors.push(
           new MessageHistory({
             storage: memoryStore,
-            lastMessages: typeof lastMessages === 'number' ? lastMessages : undefined,
+            lastMessages: lastMessages.maxMessages ?? false,
+            tokenLimit:
+              lastMessages.maxTokens === undefined
+                ? undefined
+                : {
+                    maxTokens: lastMessages.maxTokens,
+                    atMaxRemoveTokens: lastMessages.atMaxRemoveTokens!,
+                  },
           }),
         );
       }
@@ -980,6 +1112,32 @@ https://mastra.ai/en/docs/memory/overview`,
   abstract cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput>;
 
   /**
+   * Copies a thread and its messages to a new thread without returning the message
+   * payloads. Prefer this over `cloneThread` when only the new thread id is needed
+   * (e.g. forking), so large threads never have to be loaded into memory.
+   * @param args - Clone parameters including source thread ID and optional filtering options
+   * @returns Promise resolving to the new thread and the source→new message id map
+   */
+  async copyThread(args: StorageCloneThreadInput): Promise<StorageCopyThreadOutput> {
+    const { thread, messageIdMap } = await this.cloneThread(args);
+    return { thread, messageIdMap };
+  }
+
+  /**
+   * Reassign a thread and all of its messages to a different resource.
+   * Preserves the thread's `createdAt`. Performs no ownership authorization.
+   * @param args - The thread to reassign and the resource that should own it.
+   * @returns Promise resolving to the updated thread
+   */
+  updateThreadResourceId(_args: {
+    threadId: string;
+    resourceId: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<StorageThreadType> {
+    throw new Error('Thread resource transfer is not supported by this memory implementation.');
+  }
+
+  /**
    * Get serializable configuration for this memory instance
    * @returns Serializable memory configuration
    */
@@ -997,16 +1155,15 @@ https://mastra.ai/en/docs/memory/overview`,
     if (generateTitle !== undefined && config.options) {
       if (typeof generateTitle === 'boolean') {
         config.options.generateTitle = generateTitle;
-      } else if (typeof generateTitle === 'object' && generateTitle.model) {
+      } else if (typeof generateTitle === 'object' && generateTitle !== null) {
         const model = generateTitle.model;
-        // Extract ModelRouterModelId from various model configurations
+        // Extract ModelRouterModelId from string or config-object model specs.
+        // AI SDK LanguageModel instances are deliberately left unset — their
+        // modelId is not a valid model-router ID; dynamic functions cannot serialize.
         let modelId: string | undefined;
 
         if (typeof model === 'string') {
           modelId = model;
-        } else if (typeof model === 'function') {
-          // Cannot serialize dynamic functions - skip
-          modelId = undefined;
         } else if (model && typeof model === 'object') {
           // Handle config objects with id field
           if ('id' in model && typeof model.id === 'string') {
@@ -1014,12 +1171,12 @@ https://mastra.ai/en/docs/memory/overview`,
           }
         }
 
-        if (modelId && config.options) {
-          config.options.generateTitle = {
-            model: modelId as ModelRouterModelId,
-            instructions: typeof generateTitle.instructions === 'string' ? generateTitle.instructions : undefined,
-          };
-        }
+        config.options.generateTitle = {
+          ...(modelId ? { model: modelId as ModelRouterModelId } : {}),
+          ...(typeof generateTitle.instructions === 'string' ? { instructions: generateTitle.instructions } : {}),
+          ...(typeof generateTitle.minMessages === 'number' ? { minMessages: generateTitle.minMessages } : {}),
+          ...(typeof generateTitle.emitEvent === 'boolean' ? { emitEvent: generateTitle.emitEvent } : {}),
+        };
       }
     }
 
@@ -1083,6 +1240,8 @@ https://mastra.ai/en/docs/memory/overview`,
         blockAfter: obs.blockAfter,
         previousObserverTokens: obs.previousObserverTokens,
         observeAttachments: obs.observeAttachments,
+        maxRetries: obs.maxRetries,
+        failurePolicy: obs.failurePolicy,
       };
       const obsModelId = extractModelIdString(obs.model);
       if (obsModelId) {
@@ -1099,6 +1258,8 @@ https://mastra.ai/en/docs/memory/overview`,
         providerOptions: ref.providerOptions,
         blockAfter: ref.blockAfter,
         bufferActivation: ref.bufferActivation,
+        maxRetries: ref.maxRetries,
+        failurePolicy: ref.failurePolicy,
       };
       const refModelId = extractModelIdString(ref.model);
       if (refModelId) {

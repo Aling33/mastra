@@ -150,13 +150,13 @@ describe('headless goal parity', () => {
           session,
           goalManager: new GoalManager(),
           pendingNewThread: false,
-          planStartedGoalId: undefined,
           ui: { showOverlay: vi.fn(), hideOverlay: vi.fn() },
         },
         authStorage: {},
         updateStatusLine: vi.fn(),
         showInfo: vi.fn(),
         showError: vi.fn(),
+        addUserMessage: vi.fn(),
       } as any;
 
       await startGoalWithDefaults(ctx, 'finish the task');

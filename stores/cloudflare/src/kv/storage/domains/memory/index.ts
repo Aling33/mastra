@@ -270,7 +270,8 @@ export class MemoryStorageCloudflare extends MemoryStorage {
       }
 
       // Get all message keys for this thread first
-      const messageKeys = await this.#db.listKV(TABLE_MESSAGES);
+      const prefix = this.#db.namespacePrefix ? `${this.#db.namespacePrefix}:` : '';
+      const messageKeys = await this.#db.listKV(TABLE_MESSAGES, { prefix: `${prefix}${TABLE_MESSAGES}:${threadId}:` });
       const threadMessageKeys = messageKeys.filter(key => key.name.includes(`${TABLE_MESSAGES}:${threadId}:`));
 
       // Delete all messages and their order atomically
@@ -306,9 +307,13 @@ export class MemoryStorageCloudflare extends MemoryStorage {
    * directly to avoid this full scan.
    *
    * @param messageId - The globally unique message ID to search for
+   * @param options.rethrowOnError - Throw lookup failures instead of reporting the message as not found
    * @returns The message with its threadId if found, null otherwise
    */
-  private async findMessageInAnyThread(messageId: string): Promise<MastraMessageV1 | null> {
+  private async findMessageInAnyThread(
+    messageId: string,
+    { rethrowOnError = false }: { rethrowOnError?: boolean } = {},
+  ): Promise<MastraMessageV1 | null> {
     try {
       // List all threads to search for the message
       const prefix = this.#db.namespacePrefix ? `${this.#db.namespacePrefix}:` : '';
@@ -327,6 +332,7 @@ export class MemoryStorageCloudflare extends MemoryStorage {
       }
       return null;
     } catch (error) {
+      if (rethrowOnError) throw error;
       this.logger?.error(`Error finding message ${messageId} in any thread:`, error);
       return null;
     }
@@ -795,9 +801,9 @@ export class MemoryStorageCloudflare extends MemoryStorage {
 
     try {
       // Fetch and parse all messages from their respective threads (expensive: scans all threads per message)
-      const messages = (await Promise.all(messageIds.map(id => this.findMessageInAnyThread(id)))).filter(
-        result => !!result,
-      ) as (MastraMessageV1 & { _index: string })[];
+      const messages = (
+        await Promise.all(messageIds.map(id => this.findMessageInAnyThread(id, { rethrowOnError: true })))
+      ).filter(result => !!result) as (MastraMessageV1 & { _index: string })[];
 
       // Remove _index and ensure dates before returning, just like Upstash
       const prepared = messages.map(({ _index, ...message }) => ({
@@ -822,7 +828,7 @@ export class MemoryStorageCloudflare extends MemoryStorage {
       );
       this.logger?.trackException(mastraError);
       this.logger?.error(mastraError.toString());
-      return { messages: [] };
+      throw mastraError;
     }
   }
 

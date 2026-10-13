@@ -1,4 +1,5 @@
-import type { AgentConfig } from '@mastra/core/agent';
+import type { AgentConfig, MastraDBMessage } from '@mastra/core/agent';
+import type { MastraModelConfig, WidenModelId } from '@mastra/core/llm';
 import type { Mastra } from '@mastra/core/mastra';
 import type { ObservationalMemoryModelSettings } from '@mastra/core/memory';
 import type { ObservabilityContext } from '@mastra/core/observability';
@@ -56,13 +57,40 @@ export interface ProviderOptions {
   [key: string]: Record<string, any> | undefined;
 }
 
-export type ActivationTTL = number | string | 'auto' | false;
+export type ActivationTTLValue = number | string | 'auto' | false;
+
+/**
+ * Per-provider idle activation TTLs, e.g. `{ default: 'auto', anthropic: '1h' }`.
+ * Keys match the actor model's provider before the first `.`, case-insensitively.
+ */
+export type ActivationTTLByProvider = {
+  default?: ActivationTTLValue;
+  [provider: string]: ActivationTTLValue | undefined;
+};
+
+export type ActivationTTL = ActivationTTLValue | ActivationTTLByProvider;
 export type ResolvedActivationTTL = number | 'auto';
+
+/**
+ * Parsed form of {@link ActivationTTLByProvider}. Provider keys are lowercased.
+ * A provider value of `false` disables idle activation for that provider.
+ * @internal
+ */
+export interface ParsedActivationTTLMap {
+  default?: ResolvedActivationTTL;
+  providers: Record<string, ResolvedActivationTTL | false>;
+}
 
 /**
  * Configuration for the observation step (Observer agent).
  */
-export type ObservationalMemoryModel = Exclude<AgentConfig['model'], undefined> | ModelByInputTokens;
+export type ObservationalMemoryModel = 'auto' | Exclude<AgentConfig['model'], undefined> | ModelByInputTokens;
+
+/**
+ * `ObservationalMemoryModel` with model-id literals widened to `string`. Read config model
+ * fields into this before combining them (`??`, ternaries) — see `WidenModelId` in core.
+ */
+export type WidenedObservationalMemoryModel = WidenModelId<ObservationalMemoryModel>;
 
 /**
  * Controls which continuation-hint sections OM asks the Observer and Reflector to emit.
@@ -85,16 +113,27 @@ export type ContinuationHintsConfig =
 export interface ObservationConfig {
   /**
    * Model for the Observer agent.
-   * Can be a model ID string (e.g., 'openai/gpt-4o'), a LanguageModel instance,
-   * a function that returns either (for dynamic model selection),
-   * a `ModelByInputTokens` selector (for token-tiered routing),
-   * or an array of ModelWithRetries for fallback support.
+   * `'auto'` prefers Gemini when `GOOGLE_GENERATIVE_AI_API_KEY` is configured,
+   * then a low-cost model for the main model's provider when the main model's ID
+   * is known (a model ID string, or a dynamic model labeled `{ model, id }`),
+   * then the main model itself, and finally this package's default model.
+   * A dynamic model function may also return `'auto'`.
+   * Can also be a model ID string
+   * (e.g., 'openai/gpt-4o'), a LanguageModel instance, a function that returns
+   * either (for dynamic model selection), a `ModelByInputTokens` selector
+   * (for token-tiered routing), or an array of ModelWithRetries for fallback support.
    *
    * Cannot be set if a top-level `model` is also provided on ObservationalMemoryConfig.
    *
-   * @default 'google/gemini-2.5-flash'
+   * @default 'auto'
    */
   model?: ObservationalMemoryModel;
+
+  /** Number of retries after the initial Observer model call. @default 8 */
+  maxRetries?: number;
+
+  /** Terminal policy after Observer model retries are exhausted. @default 'abort' */
+  failurePolicy?: 'abort' | 'continue';
 
   /**
    * Token count of unobserved messages that triggers observation.
@@ -106,10 +145,10 @@ export interface ObservationConfig {
 
   /**
    * Model settings for the Observer agent.
-   * @default { temperature: 0.3 }
+   * @default { temperature: 0.3 } for models known to support temperature
    *
-   * Note: `maxOutputTokens: 100_000` is only applied by default when using
-   * the built-in default model selection.
+   * Note: The default `maxOutputTokens: 100_000` is only applied when using the built-in
+   * default model selection or `ModelByInputTokens`.
    */
   modelSettings?: ModelSettings;
 
@@ -190,18 +229,20 @@ export interface ObservationConfig {
   activateOnProviderChange?: boolean;
 
   /**
-   * Token threshold above which buffered activation is allowed to overshoot the
-   * retention target. Crossing `blockAfter` does not trigger a blocking observation;
-   * a synchronous observation runs when `messageTokens` is reached and buffered
-   * activation did not happen.
+   * Token threshold above which a blocking synchronous observation is allowed.
+   * Between `messageTokens` and `blockAfter`, only async buffering/activation is
+   * used: reaching the observation threshold without an activatable buffered chunk
+   * triggers background buffering instead of a blocking observation. At or above
+   * `blockAfter`, a synchronous observation runs if pending tokens still reach it
+   * after buffered activation. Buffered activation is also allowed to overshoot
+   * the retention target past this threshold.
    *
    * Accepts either:
-   * - A multiplier (1 ≤ value < 100): multiplied by `messageTokens`.
-   *   e.g. `blockAfter: 1.5` with `messageTokens: 20_000` → blocks at 30,000.
+   * - A multiplier (1 ≤ value < 100): multiplied by the record's effective `messageTokens`
+   *   (per-record overrides included). e.g. `blockAfter: 1.5` with `messageTokens: 20_000` → blocks at 30,000.
    * - An absolute token count (≥ 100): must be greater than `messageTokens`.
    *
-   * Only relevant when `bufferTokens` is set.
-   * If not set, synchronous observation is never used when async buffering is enabled.
+   * Only relevant when `bufferTokens` is set. Defaults to 1.2 when async buffering is enabled.
    */
   blockAfter?: number;
 
@@ -273,7 +314,10 @@ export interface ObservationConfig {
    * endpoints) while the main agent uses a multimodal model. The same
    * filter applies to tool results that contain image or file parts.
    *
-   * @default true
+   * When omitted, images and PDFs are forwarded. Use `true` to explicitly
+   * forward every attachment type.
+   *
+   * @default ['image/*', 'application/pdf']
    */
   observeAttachments?: 'auto' | boolean | string[];
 }
@@ -284,16 +328,27 @@ export interface ObservationConfig {
 export interface ReflectionConfig {
   /**
    * Model for the Reflector agent.
-   * Can be a model ID string (e.g., 'openai/gpt-4o'), a LanguageModel instance,
-   * a function that returns either (for dynamic model selection),
-   * a `ModelByInputTokens` selector (for token-tiered routing),
-   * or an array of ModelWithRetries for fallback support.
+   * `'auto'` prefers Gemini when `GOOGLE_GENERATIVE_AI_API_KEY` is configured,
+   * then a low-cost model for the main model's provider when the main model's ID
+   * is known (a model ID string, or a dynamic model labeled `{ model, id }`),
+   * then the main model itself, and finally this package's default model.
+   * A dynamic model function may also return `'auto'`.
+   * Can also be a model ID string
+   * (e.g., 'openai/gpt-4o'), a LanguageModel instance, a function that returns
+   * either (for dynamic model selection), a `ModelByInputTokens` selector
+   * (for token-tiered routing), or an array of ModelWithRetries for fallback support.
    *
    * Cannot be set if a top-level `model` is also provided on ObservationalMemoryConfig.
    *
-   * @default 'google/gemini-2.5-flash'
+   * @default 'auto'
    */
   model?: ObservationalMemoryModel;
+
+  /** Number of retries after the initial Reflector model call. @default 8 */
+  maxRetries?: number;
+
+  /** Terminal policy after Reflector model retries are exhausted. @default 'abort' */
+  failurePolicy?: 'abort' | 'continue';
 
   /**
    * Token count of observations that triggers reflection.
@@ -305,10 +360,10 @@ export interface ReflectionConfig {
 
   /**
    * Model settings for the Reflector agent.
-   * @default { temperature: 0 }
+   * @default { temperature: 0 } for models known to support temperature
    *
-   * Note: `maxOutputTokens: 100_000` is only applied by default when using
-   * the built-in default model selection.
+   * Note: The default `maxOutputTokens: 100_000` is only applied when using the built-in
+   * default model selection or `ModelByInputTokens`.
    */
   modelSettings?: ModelSettings;
 
@@ -431,6 +486,8 @@ export interface ObservationModelContext {
   provider?: string;
   modelId?: string;
   providerOptions?: ProviderOptions;
+  /** Exact effective actor model captured when the observation work was scheduled. */
+  model?: Exclude<AgentConfig['model'], undefined>;
 }
 
 /**
@@ -544,6 +601,15 @@ export interface DataOmObservationFailedPart {
 
     /** Error message */
     error: string;
+
+    /** Resolved failure policy for this cycle. Treat a missing value as `'abort'` (markers written before this field existed). */
+    failurePolicy?: 'abort' | 'continue';
+
+    /** Machine-readable failure classification when the observer/provider call failed. */
+    failureKind?: 'observer-model' | 'reflector-model';
+
+    /** Set when this attempt failed but the runner is retrying the same cycle, so the failure is not final. */
+    retrying?: true;
 
     /** The OM record ID */
     recordId: string;
@@ -727,6 +793,12 @@ export interface DataOmBufferingFailedPart {
     /** Error message */
     error: string;
 
+    /** Resolved failure policy for this cycle. Treat a missing value as `'abort'` (markers written before this field existed). */
+    failurePolicy?: 'abort' | 'continue';
+
+    /** Machine-readable failure classification when the observer/provider call failed. */
+    failureKind?: 'observer-model' | 'reflector-model';
+
     /** The OM record ID */
     recordId: string;
 
@@ -883,6 +955,7 @@ export interface ObservationDebugEvent {
     | 'observation_complete'
     | 'reflection_triggered'
     | 'reflection_complete'
+    | 'reflection_failed'
     | 'tokens_accumulated'
     | 'step_progress';
   timestamp: Date;
@@ -905,6 +978,10 @@ export interface ObservationDebugEvent {
   observations?: string;
   /** Previous observations (before this event) */
   previousObservations?: string;
+  /** Failure metadata for failed observation or reflection events */
+  failurePolicy?: 'abort' | 'continue';
+  failureKind?: 'observer-model' | 'reflector-model';
+  error?: string;
   /** Observer's raw output */
   rawObserverOutput?: string;
   /** LLM usage from Observer/Reflector calls */
@@ -947,12 +1024,6 @@ export interface ObservationalMemoryConfig {
   memory?: Memory;
 
   /**
-   * Run the subconscious curator (via `memory.runCuration`) after every N committed
-   * observation runs on the synchronous observe path. Off by default. Requires `memory`.
-   */
-  curationCadence?: number;
-
-  /**
    * Enable retrieval-mode observation group metadata.
    * When true, observation groups are treated as durable pointers to raw
    * message history and a `recall` tool is registered so the actor can
@@ -980,16 +1051,41 @@ export interface ObservationalMemoryConfig {
     threadId: string;
     resourceId: string;
     observedAt?: Date;
+    recordId?: string;
   }) => Promise<void>;
 
   /**
    * Model for both Observer and Reflector agents.
    * Sets the model for both agents at once. Cannot be used together with
    * `observation.model` or `reflection.model` — an error will be thrown.
+   * `'auto'` prefers Gemini when `GOOGLE_GENERATIVE_AI_API_KEY` is configured,
+   * then a low-cost model for the main model's provider when the main model's ID
+   * is known (a model ID string, or a dynamic model labeled `{ model, id }`),
+   * then the main model itself, and finally this package's default model.
+   * A dynamic model function may also return `'auto'`.
    *
-   * @default 'google/gemini-2.5-flash'
+   * @default 'auto'
    */
   model?: ObservationalMemoryModel;
+
+  /**
+   * Per-provider low-cost models for `'auto'`, replacing the built-in picks.
+   * Keys are provider IDs, values are model IDs.
+   *
+   * @example { google: 'google/gemini-3.5-flash' }
+   */
+  autoModels?: Record<string, string>;
+
+  /**
+   * Resolves the model ID `'auto'` picks into a model. Use this when the main agent's models
+   * come from your own resolver (custom credentials, gateways, or providers) so observer and
+   * reflector calls use the same routing. Receives a concrete ID, never `'auto'`.
+   * Defaults to the standard model router.
+   */
+  resolveModel?: (
+    modelId: string,
+    context: { requestContext?: RequestContext },
+  ) => MastraModelConfig | Promise<MastraModelConfig>;
 
   /**
    * Observation step configuration.
@@ -1005,6 +1101,12 @@ export interface ObservationalMemoryConfig {
    * Memory scope for observations.
    * - 'resource': Observations span all threads for a resource (cross-thread memory)
    * - 'thread': Observations are per-thread (default)
+   *
+   * @deprecated The `scope` option is deprecated. `'resource'` will be removed in a future release because it
+   * works much worse than thread scope for prompt caching and agent understanding, leaving `'thread'` (already
+   * the default) as the only scope. Omit this option to use thread scope. For cross-thread recall, enable
+   * `retrieval`; for durable facts across threads, use resource-scoped working memory. A new knowledge and
+   * subconscious memory primitive will replace resource scope.
    */
   scope?: 'resource' | 'thread';
 
@@ -1024,17 +1126,33 @@ export interface ObservationalMemoryConfig {
    * so consumers can account for OM model economics without wrapping the
    * observer/reflector models in middleware.
    *
-   * Semantics worth knowing:
-   * - Failed async-buffer cycles never throw (fire-and-forget), so the
-   *   failure is reported via the end hook's `error` field instead.
-   * - An end hook may fire with neither `usage` nor `error` when a cycle
-   *   concludes without a model call (e.g. a concurrent-observation
-   *   stale-record check skips the work).
-   * - Errors thrown (or promise rejections returned) by these hooks are
-   *   caught and logged at OM debug level (`OM_DEBUG`); they never fail the
-   *   cycle.
+   * Failed async-buffer cycles never throw (fire-and-forget), so failures are
+   * reported through the end hook's `error` field. An end hook may fire with
+   * neither `usage` nor `error` when a cycle concludes without a model call.
+   *
+   * Also accepts transform hooks (`beforeObservation`, `afterObservation`,
+   * `beforeReflection`, `afterReflection`) that can filter the messages sent
+   * to the observer or rewrite observation/reflection text before it is
+   * persisted. See {@link ObserveTransformHooks}.
    */
   hooks?: ObserveHooks;
+
+  /**
+   * Controls config-level hook execution for manual and turn-synchronous cycles.
+   *
+   * - `non-blocking` (default): hook promises are not awaited and failures are
+   *   logged without failing the cycle.
+   * - `await`: hooks are awaited in lifecycle order. A start-hook failure gates
+   *   the model call, every started cycle receives exactly one paired end hook,
+   *   and hook failures reject the synchronous/manual cycle after cleanup.
+   *
+   * Async-buffer cycles remain fire-and-forget under both modes. Their hooks
+   * settle inside the tracked background operation, but failures are consumed
+   * and logged rather than surfacing to the initiating caller.
+   *
+   * @default 'non-blocking'
+   */
+  hookExecution?: 'non-blocking' | 'await';
 
   obscureThreadIds?: boolean;
 
@@ -1060,7 +1178,8 @@ export interface ObservationalMemoryConfig {
 
   /**
    * Time before buffered observations are force-activated after inactivity.
-   * Accepts milliseconds as a number or a duration string like `"5m"` or `"1hr"`.
+   * Accepts milliseconds as a number, a duration string like `"5m"` or `"1hr"`, `"auto"`,
+   * or an object of per-provider TTLs like `{ default: 'auto', anthropic: '1h' }`.
    * When the gap between the current time and the last assistant message part's `createdAt`
    * exceeds this value, buffered observations activate regardless of whether the
    * token threshold has been reached.
@@ -1093,6 +1212,8 @@ export interface ObservationalMemoryConfig {
  */
 export interface ResolvedObservationConfig {
   model: ObservationalMemoryModel;
+  maxRetries: number;
+  failurePolicy: 'abort' | 'continue';
   /** Internal threshold - always stored as ThresholdRange for dynamic calculation */
   messageTokens: number | ThresholdRange;
   /** Whether shared token budget is enabled */
@@ -1108,7 +1229,7 @@ export interface ResolvedObservationConfig {
   /** Ratio of buffered observations to activate (0-1 float) */
   bufferActivation?: number;
   /** Time in milliseconds, or auto provider-aware TTL, before buffered observations are force-activated based on the last assistant message part timestamp */
-  activateAfterIdle?: ResolvedActivationTTL;
+  activateAfterIdle?: ResolvedActivationTTL | ParsedActivationTTLMap;
   /** Force-activate buffered observations when the actor model/provider changes */
   activateOnProviderChange?: boolean;
   /** Token threshold above which synchronous observation is forced */
@@ -1127,6 +1248,8 @@ export interface ResolvedObservationConfig {
 
 export interface ResolvedReflectionConfig {
   model: ObservationalMemoryModel;
+  maxRetries: number;
+  failurePolicy: 'abort' | 'continue';
   /** Internal threshold - always stored as ThresholdRange for dynamic calculation */
   observationTokens: number | ThresholdRange;
   /** Whether shared token budget is enabled */
@@ -1137,7 +1260,7 @@ export interface ResolvedReflectionConfig {
   /** Ratio (0-1) controlling when async reflection buffering starts */
   bufferActivation?: number;
   /** Time in milliseconds, or auto provider-aware TTL, before buffered reflections are force-activated based on the last assistant message part timestamp */
-  activateAfterIdle?: ResolvedActivationTTL;
+  activateAfterIdle?: ResolvedActivationTTL | ParsedActivationTTLMap;
   /** Force-activate buffered reflections when the actor model/provider changes */
   activateOnProviderChange?: boolean;
   /** Token threshold above which synchronous reflection is forced */
@@ -1178,8 +1301,57 @@ export interface ObserveHookContext {
   trigger?: ObserveTrigger;
 }
 
-export interface ObserveHooks {
-  onObservationStart?: (info?: ObserveHookContext) => void;
+/**
+ * Transform hooks that intercept the data flowing through an observation or
+ * reflection cycle. Unlike lifecycle hooks they are always awaited (regardless
+ * of `hookExecution`) because the pipeline cannot continue until the transform
+ * settles. Returning `undefined` passes the payload through unchanged (useful
+ * for logging or syncing to external systems); returning an object replaces
+ * it. A thrown error fails the cycle so untransformed data is never persisted;
+ * on async-buffer paths the failure surfaces via the matching end hook's
+ * `error` field. Config-level only.
+ */
+export interface ObserveTransformHooks {
+  /**
+   * Runs before the observer model sees the unobserved messages. Return
+   * `{ messages }` to filter or redact them. Returning an empty array skips
+   * the observer model call for this cycle; the original messages are still
+   * marked as observed.
+   */
+  beforeObservation?: (
+    input: { messages: MastraDBMessage[] } & ObserveHookContext,
+  ) => void | { messages: MastraDBMessage[] } | Promise<void | { messages: MastraDBMessage[] }>;
+  /**
+   * Runs on the observer's parsed observation text before it is merged into
+   * the record. Return `{ observations }` to replace it.
+   */
+  afterObservation?: (
+    input: { observations: string } & ObserveHookContext,
+  ) => void | { observations: string } | Promise<void | { observations: string }>;
+  /**
+   * Runs on the observation text about to be compressed by the reflector.
+   * Return `{ observations }` to replace what the reflector sees.
+   */
+  beforeReflection?: (
+    input: { observations: string } & ObserveHookContext,
+  ) => void | { observations: string } | Promise<void | { observations: string }>;
+  /**
+   * Runs on the reflector's parsed output before it is persisted as the new
+   * generation (or buffered reflection). Return `{ observations }` to replace it.
+   */
+  afterReflection?: (
+    input: { observations: string } & ObserveHookContext,
+  ) => void | { observations: string } | Promise<void | { observations: string }>;
+}
+
+export interface ObserveHooks extends ObserveLifecycleHooks, ObserveTransformHooks {}
+
+/**
+ * Telemetry-style hooks fired around observation/reflection cycles. These are
+ * the hooks accepted per call by `observe({ hooks })`.
+ */
+export interface ObserveLifecycleHooks {
+  onObservationStart?: (info?: ObserveHookContext) => void | Promise<void>;
   /**
    * Fires when an observation cycle ends. `providerMetadata` carries the OM
    * observer model call's full provider metadata (e.g. AI Gateway cost and
@@ -1191,8 +1363,8 @@ export interface ObserveHooks {
    */
   onObservationEnd?: (
     result: { usage?: ObserveHookUsage; error?: Error; providerMetadata?: ProviderMetadata } & ObserveHookContext,
-  ) => void;
-  onReflectionStart?: (info?: ObserveHookContext) => void;
+  ) => void | Promise<void>;
+  onReflectionStart?: (info?: ObserveHookContext) => void | Promise<void>;
   /**
    * Fires when a reflection cycle ends. `providerMetadata` carries the OM
    * reflector model call's full provider metadata; it is undefined when the
@@ -1203,5 +1375,5 @@ export interface ObserveHooks {
    */
   onReflectionEnd?: (
     result: { usage?: ObserveHookUsage; error?: Error; providerMetadata?: ProviderMetadata } & ObserveHookContext,
-  ) => void;
+  ) => void | Promise<void>;
 }

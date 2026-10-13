@@ -1,12 +1,24 @@
 import type {
+  AgentControllerThinkingLevel,
   AgentControllerThread,
   AgentControllerWireEvent,
   MastraDBMessage,
   MastraMessagePart,
 } from '@mastra/core/agent-controller';
+/** Acknowledgement for approval/suspension commands; `ok` is true only when a pending target claimed it. */
+export type AgentControllerCommandRejection = 'not_pending' | 'stale_tool_call' | 'aborting' | 'no_pending_suspension';
+
+export interface AgentControllerCommandAck {
+  ok: boolean;
+  /** Set when `ok` is false. */
+  reason?: AgentControllerCommandRejection;
+}
+
 export type { MastraDBMessage, MastraMessageContentV2, MastraMessagePart } from '@mastra/core/agent-controller';
 import type { RequestContext } from '@mastra/core/request-context';
+import type { StorageListMessagesOutput } from '@mastra/core/storage';
 
+import type { QueryParams, RouteResponse } from '../route-types.generated.js';
 import type {
   AgentControllerActiveRun,
   AgentControllerAvailableModel,
@@ -24,7 +36,7 @@ import type {
   SendNotificationResult,
   ToolCategory,
 } from '../types';
-import { parseClientRequestContext } from '../utils';
+import { isTerminalReconnectError, parseClientRequestContext } from '../utils';
 import { BaseResource } from './base';
 
 /**
@@ -47,6 +59,38 @@ type WireEventOf<T extends AgentControllerWireEvent['type']> = Extract<AgentCont
 
 /** A `MastraDBMessage` before {@link hydrateMessage} turns its `createdAt` back into a `Date`. */
 type SerializedMastraDBMessage = WireEventOf<'message_start'>['message'];
+
+type AgentControllerModernListMessagesOptions = Omit<
+  QueryParams<'GET /agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/messages'>,
+  'sessionScope' | 'limit'
+> & {
+  limit?: never;
+};
+
+type AgentControllerLegacyPagedListMessagesOptions = {
+  /** @deprecated Use `perPage` instead. May only be combined with `page`. */
+  limit: number;
+  page?: number;
+  perPage?: never;
+  orderBy?: never;
+  filter?: never;
+  include?: never;
+};
+
+/** Pagination, ordering, filtering, and include options for an Agent Controller thread's messages. */
+export type AgentControllerListMessagesOptions =
+  | AgentControllerModernListMessagesOptions
+  | AgentControllerLegacyPagedListMessagesOptions;
+
+/** A page of hydrated Agent Controller thread messages. */
+export type AgentControllerListMessagesResult = StorageListMessagesOutput;
+
+type SerializedAgentControllerListMessagesResult = Omit<
+  RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/threads/:threadId/messages'>,
+  'messages'
+> & {
+  messages: SerializedMastraDBMessage[];
+};
 
 /** An `AgentControllerThread` before {@link hydrateThread} turns its timestamps back into `Date`s. */
 type SerializedThread = WireEventOf<'thread_created'>['thread'];
@@ -79,7 +123,7 @@ type NotificationEvent =
 /** The timestamps the SDK gives back as `Date`s. {@link hydrateKnownEvent} is typed against this, so the two cannot drift. */
 type Hydrated<T> = T extends { type: 'thread_created' }
   ? Omit<T, 'thread'> & { thread: AgentControllerThread }
-  : T extends { type: 'message_start' | 'message_update' | 'message_end' }
+  : T extends { type: 'message_start' }
     ? Omit<T, 'message'> & { message: MastraDBMessage }
     : T;
 
@@ -130,6 +174,7 @@ const KNOWN_AGENT_CONTROLLER_EVENT_TYPES = new Set<string>(
     thread_changed: true,
     thread_created: true,
     thread_deleted: true,
+    thread_title_updated: true,
     subagent_start: true,
     subagent_text_delta: true,
     subagent_tool_start: true,
@@ -159,6 +204,7 @@ const KNOWN_AGENT_CONTROLLER_EVENT_TYPES = new Set<string>(
     workspace_ready: true,
     workspace_error: true,
     workspace_status_changed: true,
+    task_complete_evaluation: true,
     info: true,
     error: true,
   } satisfies Record<KnownAgentControllerEvent['type'], true>),
@@ -190,8 +236,6 @@ function isKnownParsedEvent(event: ParsedEvent): event is AgentControllerWireEve
 function hydrateKnownEvent(event: AgentControllerWireEvent | NotificationEvent): KnownAgentControllerEvent {
   switch (event.type) {
     case 'message_start':
-    case 'message_update':
-    case 'message_end':
       return { ...event, message: hydrateMessage(event.message) };
     case 'thread_created':
       return { ...event, thread: hydrateThread(event.thread) };
@@ -412,6 +456,9 @@ export class AgentControllerSession extends BaseResource {
         while (!cancelled) {
           const { done, value } = await reader.read();
           if (done) return cancelled ? { kind: 'cancelled' } : { kind: 'done' };
+          // A read() that resolved just before unsubscribe() must not deliver its
+          // frame: cancellation happened while we were awaiting.
+          if (cancelled) return { kind: 'cancelled' };
           buffer += decoder.decode(value, { stream: true });
 
           let separator: { index: number; length: number } | null;
@@ -428,6 +475,9 @@ export class AgentControllerSession extends BaseResource {
               } catch {
                 continue;
               }
+              // An earlier onEvent in this same buffered chunk may have called
+              // unsubscribe(); stop before delivering any further frames.
+              if (cancelled) return { kind: 'cancelled' };
               try {
                 options.onEvent(event);
               } catch (cause) {
@@ -499,6 +549,9 @@ export class AgentControllerSession extends BaseResource {
         let attempts = 0;
         let reconnectedResponse: Response | undefined;
         while (!reconnectedResponse) {
+          // A requestStream() that rejected after unsubscribe() must not surface
+          // as a terminal onError: honor cancellation before exhausting the budget.
+          if (cancelled) return;
           if (attempts >= reconnectOptions.maxRetries) {
             reportTerminalError(result);
             return;
@@ -509,6 +562,13 @@ export class AgentControllerSession extends BaseResource {
           try {
             reconnectedResponse = await requestStream();
           } catch (error) {
+            if (cancelled) return;
+            // Auth denials and other client errors won't resolve by resubscribing;
+            // 408/429 stay retryable.
+            if (isTerminalReconnectError(error)) {
+              safeOnError(error);
+              return;
+            }
             result = { kind: 'transport_error', error };
           }
         }
@@ -523,6 +583,13 @@ export class AgentControllerSession extends BaseResource {
           options.onReconnect?.();
         } catch {
           // Consumer callback failures must not kill the stream loop.
+        }
+        // onReconnect may have called unsubscribe(). The new response has not yet
+        // acquired a reader (pump() runs on the next iteration), so unsubscribe()
+        // had nothing to cancel — cancel its body here before the loop exits.
+        if (cancelled) {
+          void response.body?.cancel().catch(() => {});
+          return;
         }
       }
     };
@@ -565,11 +632,21 @@ export class AgentControllerSession extends BaseResource {
     await this.request(this.url(`${this.base()}/abort`), { method: 'POST' });
   }
 
-  /** Approve or decline a pending tool call (`tool_approval_required`). */
-  async approveTool(toolCallId: string, approved: boolean, options?: AgentControllerRequestOptions): Promise<void> {
+  /**
+   * Approve or decline a pending tool call (`tool_approval_required`). Resolves
+   * `{ ok: false, reason }` when no pending approval claimed the decision.
+   */
+  async approveTool(
+    toolCallId: string,
+    approved: boolean,
+    options?: AgentControllerRequestOptions,
+  ): Promise<AgentControllerCommandAck> {
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/tool-approval`), {
+    return this.request<AgentControllerCommandAck>(this.url(`${this.base()}/tool-approval`), {
       method: 'POST',
+      // Not idempotent: a replay after a lost response would be rejected as not_pending
+      // and misreport an applied decision as ignored.
+      retries: 0,
       body: { toolCallId, approved, ...(requestContext ? { requestContext } : {}) },
     });
   }
@@ -583,10 +660,13 @@ export class AgentControllerSession extends BaseResource {
     toolCallId: string,
     resumeData: string | string[] | PlanResume,
     options?: AgentControllerRequestOptions,
-  ): Promise<void> {
+  ): Promise<AgentControllerCommandAck> {
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/tool-suspension`), {
+    return this.request<AgentControllerCommandAck>(this.url(`${this.base()}/tool-suspension`), {
       method: 'POST',
+      // Not idempotent: a replay after a lost response would be rejected as not_pending
+      // and misreport an applied decision as ignored.
+      retries: 0,
       body: { toolCallId, resumeData, ...(requestContext ? { requestContext } : {}) },
     });
   }
@@ -616,11 +696,17 @@ export class AgentControllerSession extends BaseResource {
     await this.request(this.url(`${this.base()}/mode`), { method: 'POST', body: { modeId } });
   }
 
-  /** Switch the model. Defaults to thread scope. */
-  async switchModel(modelId: string, options?: { scope?: 'global' | 'thread'; modeId?: string }): Promise<void> {
+  /**
+   * Switch the session model and persist it to the active thread. When
+   * `thinkingLevel` is provided it is applied and persisted with the model.
+   */
+  async switchModel(
+    modelId: string,
+    { thinkingLevel }: { thinkingLevel?: AgentControllerThinkingLevel } = {},
+  ): Promise<void> {
     await this.request(this.url(`${this.base()}/model`), {
       method: 'POST',
-      body: { modelId, scope: options?.scope, modeId: options?.modeId },
+      body: thinkingLevel !== undefined ? { modelId, thinkingLevel } : { modelId },
     });
   }
 
@@ -639,7 +725,7 @@ export class AgentControllerSession extends BaseResource {
     if (opts.limit != null) params.set('limit', String(opts.limit));
     if (opts.tags && Object.keys(opts.tags).length > 0) params.set('tags', JSON.stringify(opts.tags));
     const query = params.toString() ? `?${params.toString()}` : '';
-    const body = await this.request<{ threads: AgentControllerThreadInfo[] }>(
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/threads'>>(
       this.url(`${this.base()}/threads${query}`),
     );
     return body.threads;
@@ -684,13 +770,47 @@ export class AgentControllerSession extends BaseResource {
     });
   }
 
-  /** List messages for a specific thread. */
-  async listMessages(threadId: string, limit?: number): Promise<MastraDBMessage[]> {
-    const params = limit != null ? `?limit=${limit}` : '';
-    const body = await this.request<{ messages: SerializedMastraDBMessage[] }>(
-      this.url(`${this.base()}/threads/${encodeURIComponent(threadId)}/messages${params}`),
+  /** List messages for a specific thread, preserving the legacy array-returning limit overload. */
+  async listMessages(threadId: string, limit?: number): Promise<MastraDBMessage[]>;
+  async listMessages(
+    threadId: string,
+    options: AgentControllerListMessagesOptions,
+  ): Promise<AgentControllerListMessagesResult>;
+  async listMessages(
+    threadId: string,
+    options?: number | AgentControllerListMessagesOptions,
+  ): Promise<MastraDBMessage[] | AgentControllerListMessagesResult> {
+    const queryParams = new URLSearchParams();
+    const legacy = typeof options === 'number' || options === undefined;
+
+    if (typeof options === 'number') {
+      queryParams.set('limit', String(options));
+    } else if (options === undefined) {
+      queryParams.set('perPage', 'false');
+    } else {
+      const { limit, page, perPage, orderBy, filter, include } = options;
+      if (
+        limit !== undefined &&
+        (perPage !== undefined || orderBy !== undefined || filter !== undefined || include !== undefined)
+      ) {
+        throw new Error('limit can only be combined with page; use perPage with orderBy, filter, or include');
+      }
+      if (limit !== undefined) queryParams.set('limit', String(limit));
+      if (page !== undefined) queryParams.set('page', String(page));
+      if (perPage !== undefined) queryParams.set('perPage', String(perPage));
+      if (orderBy) queryParams.set('orderBy', JSON.stringify(orderBy));
+      if (filter) queryParams.set('filter', JSON.stringify(filter));
+      if (include) queryParams.set('include', JSON.stringify(include));
+    }
+
+    const query = queryParams.toString();
+    const body = await this.request<SerializedAgentControllerListMessagesResult>(
+      this.url(`${this.base()}/threads/${encodeURIComponent(threadId)}/messages${query ? `?${query}` : ''}`),
     );
-    return body.messages.map(hydrateMessage);
+    const messages = body.messages.map(hydrateMessage);
+
+    if (legacy) return messages;
+    return { ...body, messages };
   }
 
   /**
@@ -706,8 +826,10 @@ export class AgentControllerSession extends BaseResource {
   }
 
   /** Get the observational memory record for this session's thread. */
-  async getOMRecord(): Promise<unknown> {
-    const body = await this.request<{ record: unknown }>(this.url(`${this.base()}/om`));
+  async getOMRecord(): Promise<RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/om'>['record']> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/om'>>(
+      this.url(`${this.base()}/om`),
+    );
     return body.record;
   }
 
@@ -720,14 +842,20 @@ export class AgentControllerSession extends BaseResource {
   }
 
   /** Get known resource IDs for this session. */
-  async getResourceIds(): Promise<string[]> {
-    const body = await this.request<{ resourceIds: string[] }>(this.url(`${this.base()}/resources`));
+  async getResourceIds(): Promise<
+    RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/resources'>['resourceIds']
+  > {
+    const body = await this.request<
+      RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/resources'>
+    >(this.url(`${this.base()}/resources`));
     return body.resourceIds;
   }
 
   /** Get the current goal for this session's thread. */
   async getGoal(): Promise<AgentControllerGoalRecord | undefined> {
-    const body = await this.request<{ goal?: AgentControllerGoalRecord }>(this.url(`${this.base()}/goal`));
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:resourceId/goal'>>(
+      this.url(`${this.base()}/goal`),
+    );
     return body.goal;
   }
 
@@ -736,10 +864,13 @@ export class AgentControllerSession extends BaseResource {
     objective: string,
     options?: { judgeModelId?: string; maxRuns?: number },
   ): Promise<AgentControllerGoalRecord | undefined> {
-    const body = await this.request<{ goal?: AgentControllerGoalRecord }>(this.url(`${this.base()}/goal`), {
-      method: 'POST',
-      body: { objective, ...options },
-    });
+    const body = await this.request<RouteResponse<'POST /agent-controller/:controllerId/sessions/:resourceId/goal'>>(
+      this.url(`${this.base()}/goal`),
+      {
+        method: 'POST',
+        body: { objective, ...options },
+      },
+    );
     return body.goal;
   }
 
@@ -749,10 +880,13 @@ export class AgentControllerSession extends BaseResource {
     maxRuns?: number;
     status?: 'active' | 'paused' | 'done';
   }): Promise<AgentControllerGoalRecord | undefined> {
-    const body = await this.request<{ goal?: AgentControllerGoalRecord }>(this.url(`${this.base()}/goal`), {
-      method: 'PUT',
-      body: options,
-    });
+    const body = await this.request<RouteResponse<'PUT /agent-controller/:controllerId/sessions/:resourceId/goal'>>(
+      this.url(`${this.base()}/goal`),
+      {
+        method: 'PUT',
+        body: options,
+      },
+    );
     return body.goal;
   }
 
@@ -814,19 +948,25 @@ export class AgentController extends BaseResource {
 
   /** List the modes configured on this agent controller (e.g. build, plan). */
   async listModes(): Promise<AgentControllerModeInfo[]> {
-    const body = await this.request<{ modes: AgentControllerModeInfo[] }>(`${this.basePath()}/modes`);
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/modes'>>(
+      `${this.basePath()}/modes`,
+    );
     return body.modes;
   }
 
   /** List available models on this agent controller (with auth status and use counts). */
   async listModels(): Promise<AgentControllerAvailableModel[]> {
-    const body = await this.request<{ models: AgentControllerAvailableModel[] }>(`${this.basePath()}/models`);
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/models'>>(
+      `${this.basePath()}/models`,
+    );
     return body.models;
   }
 
   /** List the runs in flight on this controller, across all resources. */
   async listActiveRuns(): Promise<AgentControllerActiveRun[]> {
-    const body = await this.request<{ runs: AgentControllerActiveRun[] }>(`${this.basePath()}/active-runs`);
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/active-runs'>>(
+      `${this.basePath()}/active-runs`,
+    );
     return body.runs;
   }
 

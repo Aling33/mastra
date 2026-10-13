@@ -1,6 +1,6 @@
 ---
 title: "Reference: Amazon S3 vectors store | Vectors"
-description: Documentation for the S3Vectors class in Mastra, which provides vector search using Amazon S3 Vectors (Preview).
+description: "Configure S3Vectors to create indexes, store embeddings, query similarity, filter metadata, and manage vectors with Amazon S3 Vectors."
 packages:
   - "@mastra/s3vectors"
 ---
@@ -315,7 +315,7 @@ Query results are returned in this format:
 interface QueryResult {
   id: string
   score: number // 1/(1 + distance)
-  metadata: Record<string, any>
+  metadata?: Record<string, any>
   vector?: number[] // Only included if includeVector is true
 }
 ```
@@ -343,7 +343,7 @@ S3 Vectors supports a strict subset of operators and value types. The Mastra fil
 
 **Examples:**
 
-```typescript prettier:false
+```typescript oxfmt:false
 // Implicit AND
 { genre: { $in: ["documentary", "comedy"] }, year: { $gte: 2020 } }
 
@@ -367,17 +367,21 @@ If you set `nonFilterableMetadataKeys` at index creation, those keys are stored 
 
 ## Error handling
 
-The store throws typed errors that can be caught:
+The store throws `MastraError` instances from `@mastra/core/error`:
 
 ```typescript
+import { MastraError } from '@mastra/core/error'
+
 try {
   await store.query({
     indexName: 'index-name',
     queryVector: queryVector,
   })
 } catch (error) {
-  if (error instanceof VectorStoreError) {
-    console.log(error.code) // 'connection_failed' | 'invalid_dimension' | etc
+  if (error instanceof MastraError) {
+    console.log(error.id) // 'MASTRA_VECTOR_S3VECTORS_QUERY_FAILED'
+    console.log(error.domain) // 'STORAGE'
+    console.log(error.category) // 'USER' | 'THIRD_PARTY'
     console.log(error.details) // Additional error context
   }
 }

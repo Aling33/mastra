@@ -7,7 +7,7 @@ jobs:
   issue_created:
     # Only run on the main repository, not on forks
     if: ${{ github.repository == 'mastra-ai/mastra' }}
-    runs-on: starsling-ubuntu-24.04
+    runs-on: starsling-ubuntu-26.04
     permissions:
       contents: read
 
@@ -34,7 +34,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
         working-directory: scripts/gh-issue-triage
 
       - name: Label Issue

@@ -1,247 +1,283 @@
-/**
- * The kickoff sequence (`createUserSession → startFactoryRun`) takes multiple
- * seconds; cards narrate it via `pendingRuns[].phase`. These tests gate each
- * endpoint to pin the phase the hook reports at every step, and to pin that the
- * run lands as a toast rather than yanking the board to the new thread.
- */
-import { Toaster } from '@mastra/playground-ui/components/Toaster';
-import { QueryClient } from '@tanstack/react-query';
-import { act, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
-import { createMemoryRouter, RouterProvider } from 'react-router';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ReactNode } from 'react';
+import { MemoryRouter, Route, Routes } from 'react-router';
+import { describe, expect, it } from 'vitest';
 
 import { server } from '../../../e2e/ui/msw-server';
-import { renderWithProviders, TEST_BASE_URL, waitForMutationsIdle } from '../../../e2e/ui/render';
-import { useWorkspacesQuery } from '../useWorkspaces';
-import { useStartFactoryRun } from '../useStartFactoryRun';
+import { renderHookWithProviders, TEST_BASE_URL } from '../../../e2e/ui/render';
+import { useStartFactoryRun, type StartFactoryRunWorkItem } from '../useStartFactoryRun';
 
 const FACTORY_ID = 'fp-1';
-const REPO_ID = 'repo-1';
 
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>(r => {
-    resolve = r;
-  });
-  return { promise, resolve };
+function RouteInner({ children }: { children: ReactNode }) {
+  return (
+    <MemoryRouter initialEntries={[`/factories/${FACTORY_ID}`]}>
+      <Routes>
+        <Route path="/factories/:factoryId" element={children} />
+      </Routes>
+    </MemoryRouter>
+  );
 }
 
-function stubKickoffEndpoints() {
-  const sessionGate = deferred();
-  const runGate = deferred();
-  // The workspace list the sidebar renders from. The kickoff POST appends to it,
-  // so a re-read only sees the new row if the hook invalidated the sessions key.
-  const sessions: Array<{ sessionId: string; branch: string; updatedAt: string }> = [];
-
+function stubEndpoints(
+  repositories: Array<{ id: string; externalId: string; slug: string; provider?: 'github' | 'gitlab' }>,
+) {
+  const sessionsCreatedFor: string[] = [];
+  const patches: Array<Record<string, unknown>> = [];
+  let started: Record<string, unknown> | undefined;
   server.use(
-    http.get(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/sessions`, () => HttpResponse.json({ sessions })),
     http.get(`${TEST_BASE_URL}/web/factory/projects`, () =>
       HttpResponse.json({ projects: [{ id: FACTORY_ID, name: 'Acme Factory' }] }),
     ),
     http.get(`${TEST_BASE_URL}/web/factory/projects/${FACTORY_ID}/source-control-connections`, () =>
       HttpResponse.json({
-        connections: [
-          {
-            id: 'conn-1',
-            installationId: 'inst-1',
-            repositories: [
-              {
-                id: REPO_ID,
-                branch: 'main',
-                sandboxWorkdir: '/repo',
-                repository: { slug: 'acme/app', defaultBranch: 'main' },
-              },
-            ],
-          },
-        ],
+        connections: repositories.map(repository => ({
+          id: `conn-${repository.id}`,
+          installationId: `inst-${repository.id}`,
+          integrationId: repository.provider ?? 'github',
+          repositories: [
+            {
+              id: repository.id,
+              branch: 'main',
+              sandboxWorkdir: '/repo',
+              repository: { externalId: repository.externalId, slug: repository.slug, defaultBranch: 'main' },
+            },
+          ],
+        })),
       }),
     ),
-    http.post(`${TEST_BASE_URL}/web/github/projects/${REPO_ID}/sessions`, async () => {
-      await sessionGate.promise;
-      const session = { sessionId: 'session-1', branch: 'feat/investigate-1', updatedAt: '2026-01-01T00:00:00.000Z' };
-      sessions.push(session);
-      return HttpResponse.json({ session });
-    }),
-    http.post(`${TEST_BASE_URL}/web/factory/projects/${FACTORY_ID}/runs/start`, async ({ request }) => {
-      // Thread ids track the role so a test that starts two cards at once can
-      // tell the two toasts apart.
-      const body = (await request.json()) as { workItem: { role: string } };
-      await runGate.promise;
+    http.get(`${TEST_BASE_URL}/web/intake/config`, () =>
+      HttpResponse.json({ config: { github: { enabled: true, sourceIds: [] }, linear: { enabled: false } } }),
+    ),
+    http.patch(`${TEST_BASE_URL}/web/factory/work-items/:id`, async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      patches.push(body);
       return HttpResponse.json({
-        prepared: {
-          workItemId: 'item-1',
-          bindingId: 'binding-1',
-          threadId: `thread-${body.workItem.role}`,
-          resourceId: 'resource-1',
-          sessionId: 'session-1',
-          branch: 'feat/investigate-1',
-          revision: 2,
-          kickoffStatus: 'sent',
-          replayed: false,
-        },
-      });
-    }),
-  );
-
-  return { sessionGate, runGate };
-}
-
-/** The hook reads `:factoryId` and navigates, so it renders inside a real router. */
-function renderStartFactoryRun(client?: QueryClient) {
-  // The sidebar's workspace list is mounted alongside the hook, so the test sees
-  // exactly what a user staring at the sidebar during kickoff would see. The
-  // Toaster rides along because the toast is the only way into a started run.
-  let latest!: ReturnType<typeof useStartFactoryRun> & { workspaces: ReturnType<typeof useWorkspacesQuery> };
-  function Probe() {
-    latest = { ...useStartFactoryRun(), workspaces: useWorkspacesQuery(REPO_ID) };
-    return <Toaster position="bottom-right" />;
-  }
-  const router = createMemoryRouter([{ path: '/factories/:factoryId/*', element: <Probe /> }], {
-    initialEntries: [`/factories/${FACTORY_ID}/work`],
-  });
-  const rendered = renderWithProviders(<RouterProvider router={router} />, client);
-  return { ...rendered, router, current: () => latest };
-}
-
-function startRun(current: () => ReturnType<typeof useStartFactoryRun>, role: string) {
-  act(() => {
-    current().start.mutate({
-      branch: 'feat/investigate-1',
-      threadTitle: `Investigate #1 (${role})`,
-      workItem: {
-        id: 'item-1',
-        role,
-        stages: ['triage'],
-        source: 'github-issue',
-        sourceKey: 'github-issue:1',
-        title: 'Investigate #1',
-      },
-    });
-  });
-}
-
-afterEach(() => {
-  vi.restoreAllMocks();
-});
-
-describe('useStartFactoryRun', () => {
-  it('advances the pending run phase workspace → kickoff → cleared, then offers the thread from a toast', async () => {
-    const { sessionGate, runGate } = stubKickoffEndpoints();
-    const { router, current, client } = renderStartFactoryRun();
-
-    await waitFor(() => expect(current().enabled).toBe(true));
-
-    startRun(current, 'investigator');
-
-    // Phase 1: waiting on the workspace session.
-    await waitFor(() => expect(current().pendingRuns).toHaveLength(1));
-    expect(current().pendingRuns[0]).toMatchObject({
-      id: 'item-1',
-      sourceKey: 'github-issue:1',
-      role: 'investigator',
-      phase: 'workspace',
-    });
-
-    // Phase 2: session ready, waiting on the server-side kickoff.
-    sessionGate.resolve();
-    await waitFor(() => expect(current().pendingRuns[0]?.phase).toBe('kickoff'));
-
-    // Settled: the pending run clears and the board stays exactly where it was.
-    runGate.resolve();
-    await waitForMutationsIdle(client);
-    expect(current().pendingRuns).toHaveLength(0);
-    await screen.findByText('Investigate #1 (investigator) is ready');
-    expect(router.state.location.pathname).toBe(`/factories/${FACTORY_ID}/work`);
-
-    // The toast is the way in.
-    await userEvent.click(await screen.findByRole('button', { name: 'Open' }));
-    await waitFor(() =>
-      expect(router.state.location.pathname).toBe(
-        `/factories/${FACTORY_ID}/workspaces/session-1/threads/thread-investigator`,
-      ),
-    );
-  });
-
-  it('opens a ready session in a new browser tab without leaving the board', async () => {
-    const { sessionGate, runGate } = stubKickoffEndpoints();
-    const { router, current, client } = renderStartFactoryRun();
-    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
-
-    await waitFor(() => expect(current().enabled).toBe(true));
-    startRun(current, 'reviewer');
-    sessionGate.resolve();
-    runGate.resolve();
-    await waitForMutationsIdle(client);
-
-    await userEvent.click(await screen.findByRole('button', { name: 'New Tab' }));
-
-    expect(open).toHaveBeenCalledWith(
-      `/factories/${FACTORY_ID}/workspaces/session-1/threads/thread-reviewer`,
-      '_blank',
-      'noopener,noreferrer',
-    );
-    expect(router.state.location.pathname).toBe(`/factories/${FACTORY_ID}/work`);
-  });
-
-  it('keeps the board available so several runs can be started back to back', async () => {
-    const { sessionGate, runGate } = stubKickoffEndpoints();
-    const { router, current, client } = renderStartFactoryRun();
-
-    await waitFor(() => expect(current().enabled).toBe(true));
-
-    startRun(current, 'investigator');
-    startRun(current, 'reviewer');
-
-    // Both runs are in flight at once — the first one never navigated away.
-    await waitFor(() => expect(current().pendingRuns).toHaveLength(2));
-    expect(router.state.location.pathname).toBe(`/factories/${FACTORY_ID}/work`);
-
-    sessionGate.resolve();
-    runGate.resolve();
-
-    await waitForMutationsIdle(client);
-    expect(current().pendingRuns).toHaveLength(0);
-    await screen.findByText('Investigate #1 (investigator) is ready');
-    await screen.findByText('Investigate #1 (reviewer) is ready');
-    expect(router.state.location.pathname).toBe(`/factories/${FACTORY_ID}/work`);
-  });
-
-  it('refreshes the sidebar workspace list as soon as the kickoff creates its session', async () => {
-    const { sessionGate, runGate } = stubKickoffEndpoints();
-    // Mirror the app's staleTime: without an explicit invalidation the sidebar
-    // would serve the pre-kickoff list from cache instead of refetching.
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false, staleTime: 30_000 } },
-    });
-    const { current } = renderStartFactoryRun(client);
-
-    await waitFor(() => expect(current().enabled).toBe(true));
-    // Prime the cache the way the mounted sidebar does, before any session exists.
-    await waitFor(() => expect(current().workspaces.data?.workspaces).toEqual([]));
-
-    act(() => {
-      current().start.mutate({
-        branch: 'feat/investigate-1',
-        threadTitle: 'Investigate #1',
         workItem: {
           id: 'item-1',
-          role: 'investigator',
-          stages: ['triage'],
-          source: 'github-issue',
-          sourceKey: 'github-issue:1',
-          title: 'Investigate #1',
+          factoryProjectId: FACTORY_ID,
+          externalSource: null,
+          title: 'Fix login bug',
+          stages: ['intake'],
+          stageHistory: [],
+          sessions: {},
+          metadata: body.metadata,
+          revision: 2,
+          createdAt: '2026-07-18T00:00:00.000Z',
+          updatedAt: '2026-07-18T00:00:00.000Z',
         },
       });
+    }),
+    http.post(`${TEST_BASE_URL}/web/source-control/projects/:projectRepositoryId/sessions`, ({ params }) => {
+      sessionsCreatedFor.push(String(params.projectRepositoryId));
+      return HttpResponse.json({ session: { sessionId: 'session-1', branch: 'factory/item-1', title: null } });
+    }),
+    http.post(`${TEST_BASE_URL}/web/factory/projects/${FACTORY_ID}/runs/start`, async ({ request }) => {
+      started = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json({ prepared: { threadId: 'thread-1' } });
+    }),
+  );
+  return { sessionsCreatedFor, patches, started: () => started };
+}
+
+const workItem: StartFactoryRunWorkItem = {
+  id: 'item-1',
+  role: 'work',
+  source: 'github-issue' as const,
+  sourceKey: 'github-issue:7',
+  title: 'Fix login bug',
+  // The card was filed before the repository was renamed from acme/old-name.
+  metadata: { number: 7, repository: 'acme/old-name', githubRepositoryId: 101 },
+};
+
+describe.each(['github', 'gitlab'] as const)('useStartFactoryRun with %s', provider => {
+  it.each([
+    ['a single linked repository', [{ id: 'repo-1', externalId: '101', slug: 'acme/renamed' }]],
+    [
+      'several linked repositories',
+      [
+        { id: 'repo-2', externalId: '202', slug: 'acme/other' },
+        { id: 'repo-1', externalId: '101', slug: 'acme/renamed' },
+      ],
+    ],
+  ])('starts a renamed repository card by its provider id with %s', async (_label, repositories) => {
+    const providerWorkItem: StartFactoryRunWorkItem = {
+      ...workItem,
+      source: provider === 'github' ? 'github-issue' : 'gitlab-issue',
+      sourceKey: `${provider}-issue:7`,
+      metadata: {
+        number: 7,
+        repository: 'acme/old-name',
+        ...(provider === 'github' ? { githubRepositoryId: 101 } : { gitlabProjectId: '101' }),
+      },
+    };
+    const calls = stubEndpoints(repositories.map(repository => ({ ...repository, provider })));
+    const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+    await waitFor(() => expect(result.current.enabled).toBe(true));
+
+    await result.current.start.mutateAsync({
+      branch: 'factory/item-1',
+      threadTitle: 'Fix login bug',
+      workItem: providerWorkItem,
     });
 
-    sessionGate.resolve();
-    runGate.resolve();
+    expect(calls.sessionsCreatedFor).toEqual(['repo-1']);
+    expect(calls.patches).toEqual([{ metadata: { ...providerWorkItem.metadata, repository: 'acme/renamed' } }]);
+    const startedWorkItem = calls.started()?.workItem as { input: { metadata: Record<string, unknown> } };
+    expect(startedWorkItem.input.metadata.repository).toBe('acme/renamed');
+  });
+});
 
-    await waitForMutationsIdle(client);
-    expect(current().workspaces.data?.workspaces).toEqual([
-      expect.objectContaining({ sessionId: 'session-1', branch: 'feat/investigate-1' }),
+describe.each(['github-issue', 'github-pr', 'gitlab-issue', 'gitlab-pr'] as const)(
+  'useStartFactoryRun provider selection for %s',
+  source => {
+    const provider = source.startsWith('github-') ? 'github' : 'gitlab';
+    const otherProvider = provider === 'github' ? 'gitlab' : 'github';
+
+    it.each(['sole repository fallback', 'stored slug', 'explicit slug'])(
+      'rejects the other provider via %s before any writes',
+      async selection => {
+        const calls = stubEndpoints([
+          { id: 'other-repo', provider: otherProvider, externalId: '101', slug: 'acme/other' },
+        ]);
+        const providerWorkItem: StartFactoryRunWorkItem = {
+          ...workItem,
+          source,
+          metadata: {
+            githubRepositoryId: 101,
+            gitlabProjectId: '101',
+            ...(selection === 'stored slug' ? { repository: 'acme/other' } : {}),
+          },
+        };
+        const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+        await waitFor(() => expect(result.current.enabled).toBe(true));
+
+        await expect(
+          result.current.start.mutateAsync({
+            branch: 'factory/item-1',
+            threadTitle: 'Fix login bug',
+            workItem: providerWorkItem,
+            ...(selection === 'explicit slug' ? { repositorySlug: 'acme/other' } : {}),
+          }),
+        ).rejects.toThrow('Choose a repository before starting this Factory run');
+
+        expect(calls.sessionsCreatedFor).toEqual([]);
+        expect(calls.patches).toEqual([]);
+        expect(calls.started()).toBeUndefined();
+      },
+    );
+
+    it('chooses the source provider when linked repositories share a slug', async () => {
+      const calls = stubEndpoints([
+        { id: 'other-repo', provider: otherProvider, externalId: '101', slug: 'acme/shared' },
+        { id: 'source-repo', provider, externalId: '101', slug: 'acme/shared' },
+      ]);
+      const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+      await waitFor(() => expect(result.current.enabled).toBe(true));
+
+      await result.current.start.mutateAsync({
+        branch: 'factory/item-1',
+        threadTitle: 'Fix login bug',
+        workItem: { ...workItem, source, metadata: { githubRepositoryId: 101, gitlabProjectId: '101' } },
+      });
+
+      expect(calls.sessionsCreatedFor).toEqual(['source-repo']);
+      expect(calls.started()).toMatchObject({ workItem: { input: { metadata: { repository: 'acme/shared' } } } });
+    });
+
+    it('keeps the sole-repository fallback for the same provider without metadata', async () => {
+      const calls = stubEndpoints([{ id: 'source-repo', provider, externalId: '101', slug: 'acme/source' }]);
+      const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+      await waitFor(() => expect(result.current.enabled).toBe(true));
+
+      await result.current.start.mutateAsync({
+        branch: 'factory/item-1',
+        threadTitle: 'Fix login bug',
+        workItem: { ...workItem, source, metadata: undefined },
+      });
+
+      expect(calls.sessionsCreatedFor).toEqual(['source-repo']);
+      expect(calls.started()).toMatchObject({ workItem: { input: { metadata: { repository: 'acme/source' } } } });
+    });
+  },
+);
+
+describe.each(['linear-issue', 'manual'] as const)('useStartFactoryRun fallback for %s', source => {
+  it.each(['github', 'gitlab'] as const)('keeps the sole %s repository fallback', async provider => {
+    const calls = stubEndpoints([{ id: 'repo-1', provider, externalId: '101', slug: 'acme/one' }]);
+    const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+    await waitFor(() => expect(result.current.enabled).toBe(true));
+
+    await result.current.start.mutateAsync({
+      branch: 'factory/item-1',
+      threadTitle: 'Fix login bug',
+      workItem: { ...workItem, source, metadata: undefined },
+    });
+
+    expect(calls.sessionsCreatedFor).toEqual(['repo-1']);
+    expect(calls.started()).toMatchObject({ workItem: { input: { metadata: { repository: 'acme/one' } } } });
+  });
+});
+
+describe('useStartFactoryRun in a mixed-provider factory', () => {
+  describe.each(['github', 'gitlab'] as const)('a %s card with both provider ids', provider => {
+    it.each(['both match', 'only the other provider matches'])(
+      'creates the session in the source provider when %s',
+      async matchCase => {
+        const otherProvider = provider === 'github' ? 'gitlab' : 'github';
+        const targetSlug = `acme/${provider}-renamed`;
+        const providerWorkItem: StartFactoryRunWorkItem = {
+          ...workItem,
+          source: provider === 'github' ? 'github-issue' : 'gitlab-issue',
+          sourceKey: `${provider}-issue:7`,
+          metadata: {
+            ...workItem.metadata,
+            repository: matchCase === 'both match' ? 'acme/old-name' : targetSlug,
+            githubRepositoryId: 101,
+            gitlabProjectId: '101',
+          },
+        };
+        const calls = stubEndpoints([
+          { id: 'other-repo', provider: otherProvider, externalId: '101', slug: `acme/${otherProvider}` },
+          {
+            id: 'source-repo',
+            provider,
+            externalId: matchCase === 'both match' ? '101' : '999',
+            slug: targetSlug,
+          },
+        ]);
+        const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+        await waitFor(() => expect(result.current.enabled).toBe(true));
+
+        await result.current.start.mutateAsync({
+          branch: 'factory/item-1',
+          threadTitle: 'Fix login bug',
+          workItem: providerWorkItem,
+        });
+
+        expect(calls.sessionsCreatedFor).toEqual(['source-repo']);
+        expect(calls.patches).toEqual(
+          matchCase === 'both match' ? [{ metadata: { ...providerWorkItem.metadata, repository: targetSlug } }] : [],
+        );
+        expect(calls.started()).toMatchObject({
+          workItem: { input: { metadata: { ...providerWorkItem.metadata, repository: targetSlug } } },
+        });
+      },
+    );
+  });
+
+  it('starts in GitHub when GitLab has the same external id', async () => {
+    const calls = stubEndpoints([
+      { id: 'gitlab-repo', provider: 'gitlab', externalId: '101', slug: 'acme/gitlab' },
+      { id: 'github-repo', provider: 'github', externalId: '101', slug: 'acme/renamed' },
     ]);
+    const { result } = renderHookWithProviders(() => useStartFactoryRun(), { inner: RouteInner });
+    await waitFor(() => expect(result.current.enabled).toBe(true));
+
+    await result.current.start.mutateAsync({ branch: 'factory/item-1', threadTitle: 'Fix login bug', workItem });
+
+    expect(calls.sessionsCreatedFor).toEqual(['github-repo']);
+    expect(calls.patches).toEqual([{ metadata: { ...workItem.metadata, repository: 'acme/renamed' } }]);
   });
 });

@@ -1,5 +1,7 @@
 import type { AgentScorerConfig, WorkflowScorerConfig } from '../../evals';
 import type { MastraScorer, ScorerStepName } from '../../evals/base';
+import type { NotScorableOutcome } from '../../evals/not-scorable';
+import type { TrajectoryExpectation } from '../../evals/types';
 import type { Mastra } from '../../mastra';
 import type { VersionOverrides } from '../../mastra/types';
 import type {
@@ -23,6 +25,8 @@ export interface DataItem<I = unknown, E = unknown> {
   input: I;
   /** Ground truth for scoring */
   groundTruth?: E;
+  /** Expected trajectory forwarded to trajectory scorers as `run.expectedTrajectory` */
+  expectedTrajectory?: TrajectoryExpectation;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
   /** Per-item request context merged over the global request context (item takes precedence) */
@@ -292,6 +296,41 @@ export type StartExperimentConfig<I = unknown, O = unknown, E = unknown> = Omit<
 >;
 
 /**
+ * Persisted output of an agent target. Fields whose shape depends on the agent
+ * (structured output, tool payloads, provider usage) are kept loose.
+ */
+export interface AgentExperimentOutput {
+  text?: string;
+  reasoningText?: string;
+  object?: unknown;
+  toolCalls?: Record<string, unknown>[];
+  toolResults?: Record<string, unknown>[];
+  sources?: Record<string, unknown>[];
+  files?: Record<string, unknown>[];
+  /** v2+ models report inputTokens/outputTokens; legacy models report promptTokens/completionTokens */
+  usage?: Record<string, unknown>;
+  traceId?: string | null;
+  error?: { message: string; stack?: string } | null;
+}
+
+/**
+ * Persisted output of a scorer target.
+ */
+export interface ScorerExperimentOutput {
+  score: number | null;
+  reason: string | null;
+  notScorable?: unknown;
+}
+
+/**
+ * Experiment result output discriminated by the parent experiment's target type.
+ */
+export type ExperimentResultOutput =
+  | { targetType: 'agent'; output: AgentExperimentOutput | null }
+  | { targetType: 'scorer'; output: ScorerExperimentOutput | null }
+  | { targetType: 'workflow' | 'processor' | null; output: unknown };
+
+/**
  * Result of executing a single dataset item.
  */
 export interface ItemResult {
@@ -305,6 +344,8 @@ export interface ItemResult {
   output: unknown | null;
   /** Expected output from the dataset item */
   groundTruth: unknown | null;
+  /** Metadata from the dataset item when it was executed */
+  metadata?: Record<string, unknown>;
   /** Structured error if execution failed */
   error: { message: string; stack?: string; code?: string } | null;
   /** When execution started */
@@ -345,6 +386,12 @@ export interface ScorerResult {
   reason: string | null;
   /** Error message if scorer failed */
   error: string | null;
+  /**
+   * Set when the scorer declared the item not scorable via `notScorable()`.
+   * `score` is `null` and `error` is `null`: this is neither a score nor a
+   * failure, and the item is left out of the scorer's aggregates.
+   */
+  notScorable?: NotScorableOutcome;
   /** Scorer stage that failed, when the scorer exposes stage context */
   failedStep?: ScorerStepName;
   /** Scorer stages that completed before the failure */

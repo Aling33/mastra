@@ -1,4 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { CLIENT_INFO_META_KEY } from '@modelcontextprotocol/server';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { serveHTTP } from '../server/__tests__/harness.mock';
+import { MCPServer } from '../server/server';
 import { InternalMastraMCPClient } from './client';
 import { MCPClient } from './configuration';
 
@@ -61,6 +67,7 @@ describe('MCPClient tool discovery retries', () => {
         weather_getWeather: toolset.getWeather,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(1);
   });
@@ -88,9 +95,104 @@ describe('MCPClient tool discovery retries', () => {
       errors: {
         stock: 'Validation failed',
       },
+      errorDetails: {
+        stock: { message: 'Validation failed' },
+      },
     });
     expect(weatherClient.tools).toHaveBeenCalledTimes(1);
     expect(stockClient.tools).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns structured transport details without removing legacy string errors', async () => {
+    const client = createClient();
+    const transportError = Object.assign(new Error('Error POSTing to endpoint'), {
+      status: 503,
+      code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+    });
+    const connectError = new Error('Failed to connect to MCP server weather', { cause: transportError });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockRejectedValue(connectError);
+
+    const result = await client.listToolDefinitionsWithErrors();
+
+    expect(result).toEqual({
+      definitions: {},
+      errors: {
+        weather: 'Failed to connect to MCP server weather (HTTP 503)',
+      },
+      errorDetails: {
+        weather: {
+          message: 'Failed to connect to MCP server weather (HTTP 503)',
+          httpStatus: 503,
+          code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+        },
+      },
+    });
+  });
+
+  it('exposes structured failures for resource, template, and prompt discovery', async () => {
+    const client = createMultiServerClient();
+    const weatherResources = [{ uri: 'weather://current', name: 'Current weather' }] as any;
+    const weatherTemplates = [{ uriTemplate: 'weather://forecast/{city}', name: 'Forecast' }] as any;
+    const weatherPrompts = [{ name: 'forecast', description: 'Create a forecast' }] as any;
+    const weatherClient = {
+      resources: {
+        list: vi.fn().mockResolvedValue(weatherResources),
+        templates: vi.fn().mockResolvedValue(weatherTemplates),
+      },
+      prompts: {
+        list: vi.fn().mockResolvedValue(weatherPrompts),
+      },
+    } as any;
+    const transportError = Object.assign(new Error('service unavailable'), {
+      status: 503,
+      code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+    });
+    const stockError = new Error('Failed to connect to MCP server stock', { cause: transportError });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockImplementation(async (serverName: string) => {
+      if (serverName === 'stock') throw stockError;
+      return weatherClient;
+    });
+
+    const resources = await client.resources.listWithErrors();
+    const templates = await client.resources.templatesWithErrors();
+    const prompts = await client.prompts.listWithErrors();
+    const expectedDiagnostics = {
+      errors: { stock: 'Failed to connect to MCP server stock (HTTP 503)' },
+      errorDetails: {
+        stock: {
+          message: 'Failed to connect to MCP server stock (HTTP 503)',
+          httpStatus: 503,
+          code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+        },
+      },
+    };
+
+    expect(resources).toEqual({ resources: { weather: weatherResources }, ...expectedDiagnostics });
+    expect(templates).toEqual({ templates: { weather: weatherTemplates }, ...expectedDiagnostics });
+    expect(prompts).toEqual({ prompts: { weather: weatherPrompts }, ...expectedDiagnostics });
+
+    await expect(client.resources.list()).resolves.toEqual({ weather: weatherResources });
+    await expect(client.resources.templates()).resolves.toEqual({ weather: weatherTemplates });
+    await expect(client.prompts.list()).resolves.toEqual({ weather: weatherPrompts });
+  });
+
+  it('keeps aggregate discovery isolated when an error metadata accessor throws', async () => {
+    const client = createClient();
+    const hostileError = new Proxy(Object.create(null) as object, {
+      get() {
+        throw new Error('metadata accessor failed');
+      },
+    });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockRejectedValue(hostileError);
+
+    await expect(client.listToolsWithErrors()).resolves.toEqual({
+      tools: {},
+      errors: { weather: 'Unknown error' },
+      errorDetails: { weather: { message: 'Unknown error' } },
+    });
   });
 
   it('returns healthy tools and timing diagnostics when another server exceeds its discovery budget', async () => {
@@ -119,6 +221,9 @@ describe('MCPClient tool discovery retries', () => {
       errors: {
         stock: 'Discovery timed out after 50ms',
       },
+      errorDetails: {
+        stock: { message: 'Discovery timed out after 50ms' },
+      },
       durations: {
         weather: 0,
         stock: 50,
@@ -145,11 +250,13 @@ describe('MCPClient tool discovery retries', () => {
     expect(toolsetsResult).toEqual({
       toolsets: { weather: toolset },
       errors: {},
+      errorDetails: {},
       durations: { weather: 0 },
     });
     expect(definitionsResult).toEqual({
       definitions: { weather: definitions },
       errors: {},
+      errorDetails: {},
       durations: { weather: 0 },
     });
     expect(vi.getTimerCount()).toBe(0);
@@ -172,6 +279,7 @@ describe('MCPClient tool discovery retries', () => {
         weather_getWeather: toolset.getWeather,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(2);
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
@@ -201,6 +309,7 @@ describe('MCPClient tool discovery retries', () => {
         stock_search: stockTools.search,
       },
       errors: {},
+      errorDetails: {},
     });
   });
 
@@ -221,6 +330,7 @@ describe('MCPClient tool discovery retries', () => {
         weather: toolset,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(2);
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
@@ -242,6 +352,9 @@ describe('MCPClient tool discovery retries', () => {
       toolsets: {},
       errors: {
         weather: 'Validation failed',
+      },
+      errorDetails: {
+        weather: { message: 'Validation failed' },
       },
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(1);
@@ -269,11 +382,7 @@ describe('MCPClient tool discovery retries', () => {
   });
 
   it('forwards per-server capabilities into InternalMastraMCPClient', async () => {
-    const customCapabilities = {
-      elicitation: {
-        supportedContentTypes: ['text/uri-list', 'application/vnd.mastra.form+json'],
-      },
-    } as any;
+    const customCapabilities = { elicitation: { form: {}, url: {} } };
 
     const connectSpy = vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(true);
 
@@ -281,8 +390,9 @@ describe('MCPClient tool discovery retries', () => {
       id: `configuration-test-${++clientId}`,
       servers: {
         weather: {
-          url: new URL('http://localhost:1234/sse'),
+          url: new URL('http://localhost:1234/mcp'),
           capabilities: customCapabilities,
+          inputRequests: async () => ({ action: 'decline' }),
         },
       },
     });
@@ -296,27 +406,45 @@ describe('MCPClient tool discovery retries', () => {
     expect(capabilities).toMatchObject(customCapabilities);
   });
 
-  it('registers elicitation handlers before connecting the server', async () => {
+  it('advertises form elicitation when an inputRequests handler is configured', async () => {
     const connectSpy = vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(true);
 
     const client = new MCPClient({
       id: `configuration-test-${++clientId}`,
       servers: {
         weather: {
-          url: new URL('http://localhost:1234/sse'),
+          url: new URL('http://localhost:1234/mcp'),
+          inputRequests: async () => ({ action: 'decline' }),
+        },
+        silent: {
+          url: new URL('http://localhost:5678/mcp'),
         },
       },
     });
 
     clients.push(client);
 
-    await client.elicitation.onRequest('weather', async () => ({ action: 'decline' }));
+    const withHandler = (await (client as any).getConnectedClientForServer('weather')).client._capabilities;
+    const withoutHandler = (await (client as any).getConnectedClientForServer('silent')).client._capabilities;
 
-    const internalClient = (client as any).mcpClientsById.get('weather');
-    const capabilities = internalClient.client._capabilities;
+    expect(connectSpy).toHaveBeenCalledTimes(2);
+    expect(withHandler.elicitation).toEqual({ form: {} });
+    expect(withoutHandler.elicitation).toBeUndefined();
+  });
 
-    expect(connectSpy).not.toHaveBeenCalled();
-    expect(capabilities.elicitation).toMatchObject({ form: {} });
+  it('rejects an elicitation capability without an inputRequests handler', async () => {
+    const client = new MCPClient({
+      id: `configuration-test-${++clientId}`,
+      servers: {
+        weather: {
+          url: new URL('http://localhost:1234/mcp'),
+          capabilities: { elicitation: { form: {} } },
+        },
+      },
+    });
+    clients.push(client);
+
+    await expect((client as any).getConnectedClientForServer('weather')).rejects.toThrow(/inputRequests/);
   });
 
   it('returns cached server instructions for configured servers', async () => {
@@ -440,3 +568,216 @@ describe('MCPClient tool discovery retries', () => {
   it('lists resources from all servers concurrently rather than serially', () =>
     expectConcurrentDiscovery(installResourcesMock, client => client.resources.list()));
 });
+
+describe('MCPClient clientInfo', () => {
+  const clients: MCPClient[] = [];
+  let legacy: Awaited<ReturnType<typeof recordingLegacyServer>>;
+
+  beforeAll(async () => {
+    legacy = await recordingLegacyServer();
+  });
+
+  afterAll(async () => {
+    await legacy.close();
+  });
+
+  afterEach(async () => {
+    await Promise.all(clients.map(client => client.disconnect().catch(() => {})));
+    clients.length = 0;
+  });
+
+  /** Connects every server and returns the `clientInfo` each one received in `initialize`, keyed by server name. */
+  async function wireClientInfo(client: MCPClient) {
+    clients.push(client);
+    await client.listTools();
+    return legacy.clientInfo;
+  }
+
+  const at = (server: string) => new URL(`${legacy.url}?server=${server}`);
+
+  it('defaults to the server key and version 1.0.0', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      servers: { weather: { url: at('weather') } },
+    });
+
+    expect((await wireClientInfo(client)).get('weather')).toEqual({ name: 'weather', version: '1.0.0' });
+  });
+
+  it('applies top-level clientInfo to every server', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app', version: '2.3.4' },
+      servers: {
+        weather: { url: at('weather') },
+        stock: { url: at('stock') },
+      },
+    });
+
+    const received = await wireClientInfo(client);
+    expect(received.get('weather')).toEqual({ name: 'my-app', version: '2.3.4' });
+    expect(received.get('stock')).toEqual({ name: 'my-app', version: '2.3.4' });
+  });
+
+  it('merges per-server clientInfo over the top-level default field-wise', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app', version: '2.3.4' },
+      servers: {
+        weather: { url: at('weather'), clientInfo: { version: '9.9.9' } },
+        stock: { url: at('stock'), clientInfo: { name: undefined, version: '1.2.3' } },
+      },
+    });
+
+    const received = await wireClientInfo(client);
+    expect(received.get('weather')).toEqual({ name: 'my-app', version: '9.9.9' });
+    expect(received.get('stock')).toEqual({ name: 'my-app', version: '1.2.3' });
+  });
+
+  it('sends clientInfo in request _meta on the 2026-07-28 revision', async () => {
+    const served = await serveHTTP(new MCPServer({ name: 'Modern', version: '1.0.0', tools: {} }));
+    const metas: unknown[] = [];
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body === 'string') metas.push(JSON.parse(init.body).params?._meta?.[CLIENT_INFO_META_KEY]);
+      return fetch(input, init);
+    });
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app', version: '2.3.4' },
+      servers: { modern: { url: served.url, fetch: fetchSpy } },
+    });
+    clients.push(client);
+
+    try {
+      await client.listTools();
+      expect(metas.length).toBeGreaterThan(0);
+      expect(metas).toEqual(metas.map(() => ({ name: 'my-app', version: '2.3.4' })));
+    } finally {
+      await client.disconnect();
+      await served.close();
+    }
+  });
+
+  it('keeps the server key as the tool namespace when clientInfo.name is set', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app' },
+      servers: { weather: { url: new URL('http://localhost:1234/mcp') } },
+    });
+    clients.push(client);
+
+    vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(undefined as any);
+    vi.spyOn(InternalMastraMCPClient.prototype, 'tools').mockResolvedValue({ forecast: { id: 'forecast' } } as any);
+
+    const tools = await client.listTools();
+    expect(Object.keys(tools)).toEqual(['weather_forecast']);
+    vi.restoreAllMocks();
+  });
+});
+
+describe('MCPClient clientInfo identity', () => {
+  it('keeps auto-generated ids unchanged when clientInfo is not set', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4320/mcp') } };
+    const client = new MCPClient({ servers });
+    const expected = createHash('sha256')
+      .update('MCPClient')
+      .update(JSON.stringify(servers).normalize('NFKC'))
+      .digest('hex');
+    expect((client as any).id).toBe(expected);
+    await client.disconnect();
+  });
+
+  it('treats clients with different top-level clientInfo as distinct instances', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4321/mcp') } };
+    const a = new MCPClient({ servers, clientInfo: { name: 'app-a' } });
+    const b = new MCPClient({ servers, clientInfo: { name: 'app-b' } });
+    expect((a as any).id).not.toBe((b as any).id);
+    await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+
+  it('replaces a cached explicit-id client when clientInfo changes', async () => {
+    const legacy = await recordingLegacyServer();
+    const servers = { weather: { url: new URL(`${legacy.url}?server=weather`) } };
+    const id = `client-info-identity-${++clientId}`;
+    const a = new MCPClient({ id, servers, clientInfo: { name: 'app-a' } });
+    const b = new MCPClient({ id, servers, clientInfo: { name: 'app-b' } });
+    try {
+      await b.listTools();
+      expect(legacy.clientInfo.get('weather')).toEqual({ name: 'app-b', version: '1.0.0' });
+    } finally {
+      await Promise.all([a.disconnect(), b.disconnect()]);
+      await legacy.close();
+    }
+  });
+
+  it('does not let a replaced client evict its replacement on disconnect', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4322/mcp') } };
+    const id = `client-info-identity-${++clientId}`;
+    const a = new MCPClient({ id, servers, clientInfo: { name: 'app-a' } });
+    const b = new MCPClient({ id, servers, clientInfo: { name: 'app-b' } });
+    await a.disconnect();
+    await a.disconnect();
+    const again = new MCPClient({ id, servers, clientInfo: { name: 'app-b' } });
+    expect(again).toBe(b);
+    await b.disconnect();
+  });
+
+  it('detects a clientInfo change when the caller mutates a shared object', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4322/mcp') } };
+    const id = `client-info-identity-${++clientId}`;
+    const clientInfo = { name: 'app-a' };
+    const a = new MCPClient({ id, servers, clientInfo });
+    clientInfo.name = 'app-b';
+    const b = new MCPClient({ id, servers, clientInfo });
+    expect(b).not.toBe(a);
+    await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+});
+
+/** A pre-2026 server that records the `clientInfo` from each `initialize`, keyed by the `server` query param. */
+async function recordingLegacyServer() {
+  const clientInfo = new Map<string, unknown>();
+  const httpServer = createServer(async (req, res) => {
+    if (req.method !== 'POST') return res.writeHead(405).end();
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const reply = (payload: object) =>
+      res
+        .writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? null, ...payload }));
+    switch (body.method) {
+      case 'initialize':
+        clientInfo.set(
+          new URL(req.url ?? '', 'http://localhost').searchParams.get('server') ?? '',
+          body.params.clientInfo,
+        );
+        return reply({
+          result: {
+            protocolVersion: '2025-11-25',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'legacy', version: '1' },
+          },
+        });
+      case 'notifications/initialized':
+        return res.writeHead(202).end();
+      case 'tools/list':
+        return reply({ result: { tools: [] } });
+      default:
+        return reply({ error: { code: -32601, message: 'Method not found' } });
+    }
+  });
+  const url = await new Promise<URL>(resolve =>
+    httpServer.listen(0, '127.0.0.1', () =>
+      resolve(new URL(`http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/mcp`)),
+    ),
+  );
+  return {
+    url,
+    clientInfo,
+    close: async () => {
+      httpServer.closeAllConnections();
+      await new Promise<void>(resolve => httpServer.close(() => resolve()));
+    },
+  };
+}

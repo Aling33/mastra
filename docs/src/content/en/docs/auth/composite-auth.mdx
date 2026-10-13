@@ -1,6 +1,6 @@
 ---
 title: "Composite Auth | Auth"
-description: "Documentation for the CompositeAuth class, which combines multiple authentication providers into a single auth handler."
+description: "Combine multiple Mastra authentication providers with CompositeAuth, control provider order, and support fallback across JWT, OAuth, and custom identity systems."
 packages:
   - "@mastra/core"
 ---
@@ -75,7 +75,7 @@ When a request comes in, CompositeAuth:
 
 For authorization, it calls each provider's `authorizeUser()` method until one returns `true`.
 
-```typescript prettier:false
+```typescript oxfmt:false
 // Pseudocode of CompositeAuth behavior
 async authenticateToken(token, request) {
   for (const provider of this.providers) {
@@ -201,7 +201,7 @@ To debug authentication issues, add logging to your custom providers or check in
 
 ## Limitations
 
-- All providers share the same token from the `Authorization` header
+- All providers share the same token, taken from the `Authorization` header or, when that header is missing, the `apiKey` query parameter
 - User types may differ between providers (use discriminated unions if needed)
 - No built-in way to identify which provider authenticated a request
 

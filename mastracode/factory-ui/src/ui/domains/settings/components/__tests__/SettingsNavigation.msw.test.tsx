@@ -1,4 +1,4 @@
-import { MainSidebarProvider } from '@mastra/playground-ui/components/MainSidebar';
+import { SidebarProvider } from '@mastra/playground-ui/components/Sidebar';
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -12,11 +12,11 @@ const STORAGE_KEY = 'settings-navigation-test';
 function renderNavigation() {
   return renderWithProviders(
     <MemoryRouter initialEntries={['/factories/fp-1/settings/preferences']}>
-      <MainSidebarProvider storageKey={STORAGE_KEY} mobileBreakpoint={0}>
+      <SidebarProvider storageKey={STORAGE_KEY} mobileBreakpoint={0}>
         <Routes>
           <Route path="/factories/:factoryId/settings/:section" element={<SettingsNavigation />} />
         </Routes>
-      </MainSidebarProvider>
+      </SidebarProvider>
     </MemoryRouter>,
   );
 }
@@ -33,39 +33,45 @@ describe('SettingsNavigation', () => {
     );
   });
 
-  it('separates code repositories, work intake, and agent settings into named groups', () => {
+  it('separates personal destinations from shared Factory settings', () => {
     renderNavigation();
-    expect(screen.getByRole('link', { name: 'Factory' })).toHaveAttribute('href', '/factories/fp-1/settings/factory');
 
-    const sources = screen.getByRole('region', { name: 'Sources' });
-    expect(within(sources).getByRole('link', { name: 'Connections' })).toHaveAttribute(
-      'href',
-      '/factories/fp-1/settings/connections',
-    );
-    expect(within(sources).getByRole('link', { name: 'Repositories' })).toHaveAttribute(
-      'href',
-      '/factories/fp-1/settings/repositories',
-    );
-    expect(within(sources).getByRole('link', { name: 'Work Intake' })).toHaveAttribute(
-      'href',
-      '/factories/fp-1/settings/intake',
-    );
+    const personal = screen.getByRole('region', { name: 'Your settings' });
+    const factory = screen.getByRole('region', { name: 'Factory settings' });
     expect(
-      within(sources)
+      within(personal)
         .getAllByRole('link')
         .map(link => link.textContent),
-    ).toEqual(['Repositories', 'Work Intake', 'Connections']);
-
-    const agent = screen.getByRole('region', { name: 'Agent' });
-    expect(within(agent).getByRole('link', { name: 'Models' })).toHaveAttribute(
+    ).toEqual(['My account', 'Preferences', 'Your models', 'Your memory', 'Connections']);
+    expect(
+      within(factory)
+        .getAllByRole('link')
+        .map(link => link.textContent),
+    ).toEqual([
+      'Factory models',
+      'Factory memory',
+      'Skills',
+      'Behavior',
+      'Repositories',
+      'Work Intake',
+      'Manage Factory',
+    ]);
+    expect(within(personal).getByRole('link', { name: 'Your models' })).toHaveAttribute(
+      'href',
+      '/factories/fp-1/settings/personal-models',
+    );
+    expect(within(personal).getByRole('link', { name: 'Your memory' })).toHaveAttribute(
+      'href',
+      '/factories/fp-1/settings/memory',
+    );
+    expect(within(factory).getByRole('link', { name: 'Factory models' })).toHaveAttribute(
       'href',
       '/factories/fp-1/settings/models',
     );
-    expect(within(agent).getByRole('link', { name: 'Behavior' })).toHaveAttribute(
+    expect(within(factory).getByRole('link', { name: 'Factory memory' })).toHaveAttribute(
       'href',
-      '/factories/fp-1/settings/behavior',
+      '/factories/fp-1/settings/factory-memory',
     );
-    expect(screen.queryByRole('link', { name: 'Custom' })).not.toBeInTheDocument();
   });
 
   it('keeps legacy terms searchable while showing the clearer destination label', async () => {
@@ -76,6 +82,6 @@ describe('SettingsNavigation', () => {
 
     expect(screen.getByRole('link', { name: 'Repositories' })).toBeInTheDocument();
     expect(screen.queryByRole('link', { name: 'Work Intake' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: 'Agent' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your settings' })).not.toBeInTheDocument();
   });
 });

@@ -1,8 +1,6 @@
-import { createHash } from 'node:crypto';
-
 import { Memory } from '@mastra/memory';
 import { Agent } from '@mastra/core/agent';
-import type { ToolsInput } from '@mastra/core/agent';
+import type { AgentInstructions, ToolsInput } from '@mastra/core/agent';
 import type { Mastra } from '@mastra/core';
 import { Workspace, CompositeVersionedSkillSource } from '@mastra/core/workspace';
 import type { SkillSource, VersionedSkillEntry } from '@mastra/core/workspace';
@@ -31,6 +29,7 @@ import type {
   StoredProcessorGraph,
   StorageWorkspaceRef,
   StorageBrowserRef,
+  StorageMemoryRef,
 } from '@mastra/core/storage';
 import { convertSchemaToZod } from '@mastra/schema-compat';
 
@@ -48,6 +47,7 @@ import { CrudEditorNamespace } from './base';
 import type { StorageAdapter } from './base';
 import { EditorMCPNamespace } from './mcp';
 import { createVersionFromSnapshotUpdate, getProvidedSnapshotFields } from './versioned-update';
+import { computeInlineWorkspaceIdentity } from './workspace-identity';
 
 type AgentEditorConfig = false | { instructions?: boolean; tools?: boolean | { description?: boolean } };
 
@@ -173,6 +173,15 @@ function getProvidedAgentRecordFields(input: StorageUpdateAgentInput): StorageUp
   return Object.keys(recordFields).length > 1 ? recordFields : null;
 }
 
+function isMemoryIdRef(ref: StorageMemoryRef | undefined): ref is { type: 'id'; memoryId: string } {
+  return !!ref && 'type' in ref && ref.type === 'id';
+}
+
+/** Tagged inline refs and legacy untagged configs both resolve to the serialized config. */
+function unwrapInlineMemory(ref: Exclude<StorageMemoryRef, { type: 'id' }>): SerializedMemoryConfig {
+  return 'type' in ref && ref.type === 'inline' ? ref.config : (ref as SerializedMemoryConfig);
+}
+
 // ============================================================================
 // EditorAgentNamespace
 // ============================================================================
@@ -186,6 +195,9 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
   StorageResolvedAgentType,
   Agent
 > {
+  /** IDs of stored agents this namespace registered with Mastra. */
+  private _registeredStoredAgentIds = new Set<string>();
+
   protected async getStorageAdapter(): Promise<
     StorageAdapter<
       StorageCreateAgentInput,
@@ -204,7 +216,7 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     return {
       create: input => store.create({ agent: input }),
       getByIdResolved: async (id, options) => {
-        if (options?.versionId || options?.versionNumber) {
+        if (options?.versionId || options?.versionNumber !== undefined) {
           // Fetch the agent metadata first
           const agent = await store.getById(id);
           if (!agent) return null;
@@ -396,9 +408,8 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
         });
         this.logger?.debug(`[ensureStoredWorkspace] Persisted runtime workspace '${workspaceRef.workspaceId}' to DB`);
       } else if (workspaceRef.type === 'inline') {
-        // Derive a deterministic ID from the inline config
-        const configHash = createHash('sha256').update(JSON.stringify(workspaceRef.config)).digest('hex').slice(0, 12);
-        const workspaceId = `inline-${configHash}`;
+        // Derive a deterministic, key-order-independent ID from the inline config
+        const { workspaceId, configHash } = computeInlineWorkspaceIdentity(workspaceRef.config);
 
         // Check if already stored in DB
         const existing = await workspaceNs.getById(workspaceId);
@@ -422,6 +433,9 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
   }
 
   protected override onCacheEvict(id: string): void {
+    // Drop ownership tracking regardless of the registry outcome so the set
+    // never leaks stale IDs.
+    this._registeredStoredAgentIds.delete(id);
     // Only remove stored agents from the Mastra registry.
     // Code-defined agents must survive cache eviction because they live
     // in code and may only have a stored config overlay.
@@ -432,6 +446,22 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
       }
     } catch {
       // Agent not found in registry — nothing to remove
+    }
+  }
+
+  /**
+   * Clear cached agents. Extends the base clear-all to also evict stored agents
+   * that were registered with Mastra via version-specific requests, which skip
+   * the value cache and would otherwise survive a no-ID clearCache().
+   */
+  override clearCache(id?: string): void {
+    super.clearCache(id);
+    // Targeted clears already ran onCacheEvict(id) (which pruned the set) via
+    // the base implementation; only clear-all needs to mop up untracked-in-cache
+    // registrations.
+    if (id) return;
+    for (const registeredId of Array.from(this._registeredStoredAgentIds)) {
+      this.onCacheEvict(registeredId);
     }
   }
 
@@ -567,7 +597,7 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     if (instructionsEditable && storedConfig.instructions !== undefined && storedConfig.instructions !== null) {
       const resolved = this.resolveStoredInstructions(storedConfig.instructions);
       if (resolved !== undefined) {
-        fork.__updateInstructions(resolved);
+        fork.__updateInstructions(this.mergeInstructionEnvelope(agent, resolved));
       }
     }
 
@@ -760,6 +790,44 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     return result;
   }
 
+  /**
+   * Accumulate matching memory variants. Inline configs shallow-merge like
+   * other object fields, but a registered-memory reference replaces whatever
+   * has accumulated (and a later inline variant replaces a reference), so the
+   * result is never a hybrid of a reference and inline config.
+   */
+  private accumulateMemoryVariants(
+    variants: StorageConditionalVariant<StorageMemoryRef>[],
+    context: Record<string, unknown>,
+  ): StorageMemoryRef | undefined {
+    let result: StorageMemoryRef | undefined;
+    for (const variant of variants) {
+      if (variant.rules && !evaluateRuleGroup(variant.rules, context)) continue;
+      if (isMemoryIdRef(variant.value)) {
+        result = variant.value;
+        continue;
+      }
+      const inline = unwrapInlineMemory(variant.value);
+      result = result && !isMemoryIdRef(result) ? { ...unwrapInlineMemory(result), ...inline } : { ...inline };
+    }
+    return result;
+  }
+
+  private resolveConditionalMemory(variants: StorageConditionalVariant<StorageMemoryRef>[]) {
+    const registeredMemory = new Map<string, MastraMemory>();
+    const usableVariants = variants.filter(variant => {
+      if (!isMemoryIdRef(variant.value)) return true;
+      const registered = this.resolveRegisteredMemory(variant.value.memoryId);
+      if (registered) registeredMemory.set(variant.value.memoryId, registered);
+      return Boolean(registered);
+    });
+
+    return ({ requestContext }: { requestContext: RequestContext }) => {
+      const resolved = this.accumulateMemoryVariants(usableVariants, requestContext.toJSON());
+      return isMemoryIdRef(resolved) ? registeredMemory.get(resolved.memoryId) : this.resolveStoredMemory(resolved);
+    };
+  }
+
   private async createAgentFromStoredConfig(storedAgent: StorageResolvedAgentType): Promise<Agent> {
     if (!this.mastra) {
       throw new Error('MastraEditor is not registered with a Mastra instance');
@@ -916,17 +984,12 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
         }
       : this.resolveStoredAgents(storedAgent.agents as Record<string, StorageToolConfig> | string[] | undefined);
 
-    // Memory (object): accumulate by merging config from all matching variants
+    // Memory: inline variants merge; a registered-memory reference replaces the accumulated value.
+    // References are looked up once here. A conditional variant whose reference is not registered
+    // is skipped (with a warning), as if it were absent.
     const memory = hasConditionalMemory
-      ? ({ requestContext }: { requestContext: RequestContext }) => {
-          const ctx = requestContext.toJSON();
-          const resolved = this.accumulateObjectVariants(
-            storedAgent.memory as StorageConditionalVariant<SerializedMemoryConfig>[],
-            ctx,
-          );
-          return this.resolveStoredMemory(resolved as SerializedMemoryConfig | undefined);
-        }
-      : this.resolveStoredMemory(storedAgent.memory as SerializedMemoryConfig | undefined);
+      ? this.resolveConditionalMemory(storedAgent.memory as StorageConditionalVariant<StorageMemoryRef>[])
+      : this.resolveStoredMemory(storedAgent.memory as StorageMemoryRef | undefined);
 
     // Scorers (Record): accumulate by merging objects from all matching variants
     const scorers = hasConditionalScorers
@@ -1133,6 +1196,7 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     // endpoint to show the agent as "stored" instead of "code".
     if (!this.getCodeDefinedAgent(storedAgent.id)) {
       this.mastra?.addAgent(agent, storedAgent.id, { source: 'stored' });
+      this._registeredStoredAgentIds.add(storedAgent.id);
     }
     this.logger?.debug(`[createAgentFromStoredConfig] Successfully created agent "${storedAgent.id}"`);
 
@@ -1159,6 +1223,83 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     };
   }
 
+  /**
+   * Wrap stored instruction text in the code-defined agent's message envelope.
+   *
+   * Stored overrides can only carry plain text (`string | AgentInstructionBlock[]`),
+   * but code-defined instructions may be structured system messages carrying
+   * `providerOptions` (e.g. `anthropic.cacheControl` prompt-cache breakpoints).
+   * Studio owns the wording; code keeps the envelope, so publishing an edit
+   * can't silently drop provider options.
+   *
+   * When the code instructions are plain text (or absent, e.g. editor-owned
+   * agents), the stored value is returned unchanged. When code instructions are
+   * an array of messages, the last message's envelope is kept: an Anthropic
+   * cache breakpoint on the last system block covers everything before it, so
+   * it is the one worth preserving when Studio flattens the array into one text.
+   */
+  private mergeInstructionEnvelope(
+    agent: Agent,
+    stored:
+      | string
+      | (({ requestContext, mastra }: { requestContext: RequestContext; mastra?: Mastra }) => Promise<string>),
+  ):
+    | AgentInstructions
+    | (({
+        requestContext,
+        mastra,
+      }: {
+        requestContext: RequestContext;
+        mastra?: Mastra;
+      }) => Promise<AgentInstructions>) {
+    const raw = (
+      agent as Agent & { __getOverridableFields?: () => { instructions?: unknown } }
+    ).__getOverridableFields?.()?.instructions;
+
+    type Envelope = Record<string, unknown> & { content: unknown };
+    const pickEnvelope = (value: unknown): Envelope | undefined => {
+      const candidate = Array.isArray(value) ? value[value.length - 1] : value;
+      return typeof candidate === 'object' && candidate !== null && 'content' in candidate
+        ? (candidate as Envelope)
+        : undefined;
+    };
+    const wrap = (envelope: Envelope, text: string): AgentInstructions =>
+      ({ ...envelope, content: text }) as AgentInstructions;
+
+    // Plain-text code instructions (or none at all) — nothing to preserve.
+    if (
+      raw == null ||
+      typeof raw === 'string' ||
+      (Array.isArray(raw) && raw.every(entry => typeof entry === 'string'))
+    ) {
+      return stored;
+    }
+
+    if (typeof raw !== 'function') {
+      const envelope = pickEnvelope(raw);
+      if (!envelope) return stored;
+      if (typeof stored === 'string') return wrap(envelope, stored);
+      return async args => wrap(envelope, await stored(args));
+    }
+
+    // Dynamic code instructions: resolve the original at request time (same
+    // pattern as the tools merge above) and re-attach whatever envelope it produced.
+    const getOriginal = agent.getInstructions.bind(agent);
+    return async ({ requestContext, mastra }) => {
+      const text = typeof stored === 'string' ? stored : await stored({ requestContext, mastra });
+      let original: unknown;
+      try {
+        original = await getOriginal({ requestContext });
+      } catch {
+        // Dynamic instructions may require context this request can't provide;
+        // fall back to the stored text rather than failing the run.
+        return text;
+      }
+      const envelope = pickEnvelope(original);
+      return envelope ? wrap(envelope, text) : text;
+    };
+  }
+
   private applyStoredToolDescriptions(
     codeTools: ToolsInput,
     storedTools?: Record<string, StorageToolConfig> | string[],
@@ -1169,12 +1310,13 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
 
     let nextTools: ToolsInput | undefined;
     for (const [toolKey, toolConfig] of Object.entries(storedTools)) {
-      if (!toolConfig.description || !(toolKey in codeTools)) {
+      const codeTool = codeTools[toolKey];
+      if (toolConfig.description === undefined || !codeTool) {
         continue;
       }
 
       nextTools ??= { ...codeTools };
-      nextTools[toolKey] = { ...codeTools[toolKey], description: toolConfig.description };
+      nextTools[toolKey] = { ...codeTool, description: toolConfig.description };
     }
 
     return nextTools ?? codeTools;
@@ -1470,8 +1612,8 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     return resolvedAgents;
   }
 
-  private resolveStoredMemory(memoryConfig?: SerializedMemoryConfig): MastraMemory | undefined {
-    if (!memoryConfig) {
+  private resolveStoredMemory(memoryRef?: StorageMemoryRef): MastraMemory | undefined {
+    if (!memoryRef) {
       this.logger?.debug(`[resolveStoredMemory] No memory config provided`);
       return undefined;
     }
@@ -1479,6 +1621,32 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
       this.logger?.warn('MastraEditor not registered with Mastra instance. Cannot instantiate memory.');
       return undefined;
     }
+
+    if (isMemoryIdRef(memoryRef)) {
+      return this.resolveRegisteredMemory(memoryRef.memoryId);
+    }
+
+    return this.buildInlineMemory(unwrapInlineMemory(memoryRef));
+  }
+
+  /**
+   * Look up a Memory instance registered on Mastra, by registry key first and
+   * then by the instance's own id. A missing reference is not fatal: the agent
+   * runs without memory and stored threads/messages are left untouched.
+   */
+  private resolveRegisteredMemory(memoryId: string): MastraMemory | undefined {
+    const registry = (this.mastra?.listMemory() ?? {}) as Record<string, MastraMemory>;
+    const memory = registry[memoryId] ?? Object.values(registry).find(m => m.id === memoryId);
+    if (!memory) {
+      this.logger?.warn(
+        `Memory "${memoryId}" referenced in stored agent but not registered in Mastra. The agent will run without memory.`,
+      );
+    }
+    return memory;
+  }
+
+  private buildInlineMemory(memoryConfig: SerializedMemoryConfig): MastraMemory | undefined {
+    if (!this.mastra) return undefined;
 
     try {
       let vector: MastraVectorProvider | undefined;
@@ -1652,9 +1820,17 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     const agentsResolved = await agent.listAgents({ requestContext });
     const agentKeys = Object.keys(agentsResolved || {});
 
-    // 6. Extract memory config
+    // 6. Extract memory: keep a reference when the agent uses registered memory,
+    // otherwise snapshot the serializable config
     const memory = await agent.getMemory({ requestContext });
-    const memoryConfig = memory?.getConfig();
+    const registeredMemoryKey = memory
+      ? Object.entries((this.mastra?.listMemory() ?? {}) as Record<string, MastraMemory>).find(
+          ([, registered]) => registered === memory,
+        )?.[0]
+      : undefined;
+    const memoryConfig: StorageMemoryRef | undefined = registeredMemoryKey
+      ? { type: 'id', memoryId: registeredMemoryKey }
+      : memory?.getConfig();
 
     // 7. Processors from code-defined agents cannot be automatically serialized
     // to a StoredProcessorGraph (requires provider ID + config). Processors must
@@ -1782,8 +1958,8 @@ export class EditorAgentNamespace extends CrudEditorNamespace<
     if (workspaceRef.type === 'inline') {
       // Use a deterministic ID based on config content to avoid leaking
       // duplicate workspace instances on repeated calls.
-      const configHash = createHash('sha256').update(JSON.stringify(workspaceRef.config)).digest('hex').slice(0, 12);
-      return workspaceNs.hydrateSnapshotToWorkspace(`inline-${configHash}`, workspaceRef.config, hydrateOptions);
+      const { workspaceId } = computeInlineWorkspaceIdentity(workspaceRef.config);
+      return workspaceNs.hydrateSnapshotToWorkspace(workspaceId, workspaceRef.config, hydrateOptions);
     }
 
     if (workspaceRef.type === 'provider') {

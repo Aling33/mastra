@@ -1,7 +1,13 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { RequestContext } from '@mastra/core/request-context';
 import type { Skill } from '@mastra/core/workspace';
 import { Hono } from 'hono';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { __clearSessionSandboxesForTests, getSessionSandbox } from '../sandbox/session-sandbox.js';
 import { SourceControlStorageInMemory } from '../storage/domains/source-control/inmemory.js';
 import { SkillRoutes } from './skills.js';
 import { fakeRouteAuth, mountApiRoutes } from './test-utils.js';
@@ -23,10 +29,11 @@ function createHarness(
   options: {
     authorized?: boolean;
     workspaceBThrows?: boolean;
+    user?: unknown;
   } = {},
 ) {
-  const sendA = vi.fn(async (_input: { content: string }) => {});
-  const sendB = vi.fn(async (_input: { content: string }) => {});
+  const sendA = vi.fn(async (_input: { content: string; requestContext?: RequestContext }) => {});
+  const sendB = vi.fn(async (_input: { content: string; requestContext?: RequestContext }) => {});
   const refreshA = vi.fn(async () => {});
   const refreshB = vi.fn(async () => {});
   const getA = vi.fn(async (name: string) => (name === skill.name ? skill : undefined));
@@ -63,7 +70,13 @@ function createHarness(
         }
       : { allowed: true as const },
   );
+  const requestContext = new RequestContext();
+  requestContext.set('user', options.user ?? { workosId: 'user-1', organizationId: 'org-1' });
   const app = new Hono();
+  app.use('*', async (context, next) => {
+    context.set('requestContext' as never, requestContext);
+    await next();
+  });
   mountApiRoutes(
     app as never,
     new SkillRoutes({
@@ -83,6 +96,7 @@ function createHarness(
     getB,
     getSessionByResource,
     authorizeSessionAddress,
+    requestContext,
   };
 }
 
@@ -112,6 +126,7 @@ function prepare(app: Hono, body: Record<string, unknown>, controllerId = 'code'
 describe('workspace skill invocation route', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __clearSessionSandboxesForTests();
   });
 
   it('formats and dispatches a workspace skill once with escaped arguments', async () => {
@@ -139,7 +154,28 @@ describe('workspace skill invocation route', () => {
     expect(harness.refreshA).toHaveBeenCalledOnce();
     expect(harness.refreshA.mock.invocationCallOrder[0]!).toBeLessThan(harness.getA.mock.invocationCallOrder[0]!);
     expect(harness.sendA).toHaveBeenCalledOnce();
-    expect(harness.sendA).toHaveBeenCalledWith({ content: message });
+    expect(harness.sendA).toHaveBeenCalledWith({ content: message, requestContext: harness.requestContext });
+  });
+
+  it('forwards a Better Auth session-shaped principal unchanged', async () => {
+    const user = {
+      session: { activeOrganizationId: 'org-1' },
+      user: { id: 'user-1' },
+    };
+    const harness = createHarness({ user });
+
+    const response = await invoke(harness.app, {
+      resourceId: 'resource-1',
+      scope: '/worktrees/a',
+      name: 'understand-pr',
+    });
+
+    expect(response.status).toBe(200);
+    expect(harness.requestContext.get('user')).toBe(user);
+    expect(harness.sendA).toHaveBeenCalledWith({
+      content: expect.stringContaining('<skill name="understand-pr">'),
+      requestContext: harness.requestContext,
+    });
   });
 
   it('prepares the exact activation envelope without dispatching it', async () => {
@@ -281,7 +317,7 @@ describe('workspace skill invocation route', () => {
     expect(harness.sendA).not.toHaveBeenCalled();
   });
 
-  it('enforces authenticated tenant worktree ownership before session lookup', async () => {
+  it('enforces a viewer-visible session with a live workdir at the scope before session lookup', async () => {
     const sourceControlStorage = new SourceControlStorageInMemory();
     const sendMessage = vi.fn(async () => {});
     const getSessionByResource = vi.fn(async () => ({
@@ -318,7 +354,6 @@ describe('workspace skill invocation route', () => {
       error: 'invalid_request',
       message: 'Invalid skill invocation request.',
     });
-    expect(sourceControlStorage.worktreesRows).toHaveLength(0);
 
     const factoryProjectId = '00000000-0000-4000-8000-000000000001';
     const missingProjectRepositoryId = '00000000-0000-4000-8000-000000000002';
@@ -363,13 +398,29 @@ describe('workspace skill invocation route', () => {
       sandboxProvider: 'local',
       sandboxWorkdir: '/workspace/repository',
     });
-    await sourceControlStorage.worktrees.upsert({
+    const sessionRow = await sourceControlStorage.sessions.create({
+      sessionId: '00000000-0000-4000-8000-00000000abcd',
       projectRepositoryId: projectRepository.id,
+      orgId: 'org-1',
       userId: 'user-1',
-      branch: 'review-42',
+      branch: 'user/session-00000000-0000-4000-8000-00000000abcd',
       baseBranch: 'main',
-      worktreePath: '/worktrees/review-42',
     });
+
+    // A session row alone is not enough: the scope must match a LIVE memoized
+    // sandbox workdir (fail closed when no VM has resolved one).
+    const noLiveWorkdir = await invoke(app, {
+      resourceId: factoryProjectId,
+      projectRepositoryId: projectRepository.id,
+      scope: '/worktrees/review-42',
+      name: 'understand-pr',
+    });
+    expect(noLiveWorkdir.status).toBe(403);
+    expect(getSessionByResource).not.toHaveBeenCalled();
+
+    const entry = getSessionSandbox(sessionRow.id, 'acme/repository', () => ({ provider: 'fake' }) as never);
+    entry.workdir = '/worktrees/review-42';
+
     const allowed = await invoke(app, {
       resourceId: factoryProjectId,
       projectRepositoryId: projectRepository.id,
@@ -457,8 +508,9 @@ describe('factory skills catalog route', () => {
     const response = await app.request('/web/factory/skills');
     expect(response.status).toBe(200);
     const { skills } = (await response.json()) as {
-      skills: { name: string; description: string; content: string }[];
+      skills: { name: string; description: string; content: string; error?: string }[];
     };
+    expect(skills.filter(s => s.error)).toEqual([]);
     const names = skills.map(s => s.name);
     expect(names).toContain('factory-triage');
     expect(names).toContain('factory-plan');
@@ -473,5 +525,64 @@ describe('factory skills catalog route', () => {
     const app = createCatalogApp({ user: { workosId: 'user-1', organizationId: 'org-1' } });
     const response = await app.request('/web/factory/skills');
     expect(response.status).toBe(200);
+  });
+
+  describe('with repo-local overrides', () => {
+    let projectDir: string;
+
+    beforeEach(() => {
+      projectDir = mkdtempSync(join(tmpdir(), 'factory-skills-catalog-'));
+      vi.spyOn(process, 'cwd').mockReturnValue(projectDir);
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      rmSync(projectDir, { recursive: true, force: true });
+    });
+
+    function writeLocalSkill(dir: string, content: string) {
+      mkdirSync(join(projectDir, 'factory-skills', dir), { recursive: true });
+      writeFileSync(join(projectDir, 'factory-skills', dir, 'SKILL.md'), content);
+    }
+
+    async function listSkills() {
+      const response = await createCatalogApp({ authEnabled: false }).request('/web/factory/skills');
+      expect(response.status).toBe(200);
+      const { skills } = (await response.json()) as {
+        skills: { name: string; description: string; content: string; error?: string }[];
+      };
+      return skills;
+    }
+
+    it('reports a skill whose frontmatter the runtime cannot parse', async () => {
+      writeLocalSkill(
+        'factory-triage',
+        '---\nname: factory-triage\ndescription: Use when the user says: triage this issue\n---\n\n# Local Triage\n',
+      );
+      const skills = await listSkills();
+      const triage = skills.find(s => s.name === 'factory-triage')!;
+      expect(triage.error).toMatch(/^Invalid frontmatter:/);
+      expect(triage.description).toBe('');
+      expect(triage.content).toBe('# Local Triage');
+      expect(skills.find(s => s.name === 'factory-plan')!.error).toBeUndefined();
+    });
+
+    it('reports a skill whose metadata fails runtime validation', async () => {
+      writeLocalSkill('factory-plan', '---\nname: not-factory-plan\ndescription: Plan things\n---\n\n# Local Plan\n');
+      const plan = (await listSkills()).find(s => s.name === 'factory-plan')!;
+      expect(plan.error).toMatch(/must match directory name/);
+      expect(plan.description).toBe('Plan things');
+      expect(plan.content).toBe('# Local Plan');
+    });
+
+    it('parses quoted and block-scalar descriptions the way the runtime does', async () => {
+      writeLocalSkill(
+        'factory-triage',
+        '---\nname: factory-triage\ndescription: >-\n  Use when the user says: triage this issue\n---\n\n# Local Triage\n',
+      );
+      const triage = (await listSkills()).find(s => s.name === 'factory-triage')!;
+      expect(triage.error).toBeUndefined();
+      expect(triage.description).toBe('Use when the user says: triage this issue');
+    });
   });
 });

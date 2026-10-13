@@ -1,9 +1,12 @@
 import { createClient } from '@libsql/client';
-import type { Client } from '@libsql/client';
 import type { RetentionConfig, StorageDomains } from '@mastra/core/storage';
 import { MastraCompositeStore } from '@mastra/core/storage';
 
+import { gateIfLocalFile } from '../shared/file-transaction-gate';
+import { resetConnectionsAfterBusy } from '../shared/reset-after-busy-client';
+import { gateSingleConnectionClient, isSingleConnectionDatabase } from '../shared/single-connection-client';
 import { DEFAULT_CONNECTION_TIMEOUT_MS } from './db';
+import type { SqliteClient as Client } from './db/client';
 import { AgentsLibSQL } from './domains/agents';
 import { BackgroundTasksLibSQL } from './domains/background-tasks';
 import { BlobsLibSQL } from './domains/blobs';
@@ -12,7 +15,7 @@ import { DatasetsLibSQL } from './domains/datasets';
 import { ExperimentsLibSQL } from './domains/experiments';
 import { FavoritesLibSQL } from './domains/favorites';
 import { HarnessLibSQL } from './domains/harness';
-import { KnowledgeLibSQL } from './domains/knowledge';
+import { getLibSQLKnowledgeIsolationKey, KnowledgeLibSQL } from './domains/knowledge';
 import { MCPClientsLibSQL } from './domains/mcp-clients';
 import { MCPServersLibSQL } from './domains/mcp-servers';
 import { MemoryLibSQL } from './domains/memory';
@@ -57,6 +60,16 @@ export {
   WorkspacesLibSQL,
 };
 export type { LibSQLDomainConfig } from './db';
+export type {
+  SqliteClient,
+  SqliteInArgs,
+  SqliteInValue,
+  SqliteResultSet,
+  SqliteStatement,
+  SqliteTransaction,
+  SqliteTransactionMode,
+  SqliteValue,
+} from './db/client';
 export { LibSQLFactoryStorage, type LibSQLFactoryStorageConfig } from './factory-storage';
 
 export type LibSQLStorageDomain = keyof StorageDomains;
@@ -83,6 +96,12 @@ export type LibSQLLocalPragmaOptions = {
  */
 export type LibSQLBaseConfig = {
   id: string;
+  /**
+   * Identifies the database this store's Knowledge tables live in. `Mastra` rejects two Knowledge
+   * runtimes with the same key. Set it when two stores reach different databases that Mastra
+   * cannot tell apart, or the same database through different connection settings.
+   */
+  storageIsolationKey?: string;
   /**
    * Maximum number of retries for write operations if an SQLITE_BUSY error occurs.
    * @default 5
@@ -145,6 +164,16 @@ export type LibSQLConfig =
   | (LibSQLBaseConfig & {
       url: string;
       authToken?: string;
+      /**
+       * URL of the remote primary database to sync from, enabling an embedded
+       * replica (e.g. 'libsql://your-db.turso.io'). Requires a local `file:` url.
+       */
+      syncUrl?: string;
+      /**
+       * Interval in seconds for automatic sync with the remote primary.
+       * Only applies when `syncUrl` is set.
+       */
+      syncInterval?: number;
     })
   | (LibSQLBaseConfig & {
       client: Client;
@@ -194,20 +223,31 @@ export class LibSQLStore extends MastraCompositeStore {
     };
 
     if ('url' in config) {
-      // need to re-init every time for in memory dbs or the tables might not exist
-      if (config.url.includes(':memory:')) {
-        this.shouldCacheInit = false;
-      }
+      // Embedded replicas (`file:` url + `syncUrl`) are managed by the libsql
+      // sync engine, so local pragma tuning and busy_timeout don't apply.
+      this.isLocalDb = (config.url.startsWith('file:') || config.url.includes(':memory:')) && !config.syncUrl;
 
-      this.isLocalDb = config.url.startsWith('file:') || config.url.includes(':memory:');
-
-      this.client = createClient({
+      const client = createClient({
         url: config.url,
         ...(config.authToken ? { authToken: config.authToken } : {}),
+        ...(config.syncUrl ? { syncUrl: config.syncUrl } : {}),
+        ...(config.syncInterval !== undefined ? { syncInterval: config.syncInterval } : {}),
         // `busy_timeout` only applies to local sqlite3 connections; remote
         // contention is handled server-side. See libsql-client-ts#288/#345.
         ...(this.isLocalDb ? { timeout: this.connectionTimeoutMs } : {}),
       });
+      this.client = isSingleConnectionDatabase(config)
+        ? gateSingleConnectionClient(client)
+        : this.isLocalDb
+          ? gateIfLocalFile(
+              resetConnectionsAfterBusy(client, {
+                afterReset: () => this.applyLocalPragmas(client),
+                maxWaitMs: this.connectionTimeoutMs,
+              }),
+              config.url,
+              { maxWaitMs: this.connectionTimeoutMs },
+            )
+          : client;
       this.pragmasReady = this.isLocalDb ? this.applyLocalPragmas() : Promise.resolve();
     } else {
       this.client = config.client;
@@ -217,6 +257,7 @@ export class LibSQLStore extends MastraCompositeStore {
 
     const domainConfig = {
       client: this.client,
+      embeddedReplica: 'url' in config && !!config.syncUrl,
       maxRetries: this.maxRetries,
       initialBackoffMs: this.initialBackoffMs,
     };
@@ -225,7 +266,10 @@ export class LibSQLStore extends MastraCompositeStore {
     const workflows = new WorkflowsLibSQL(domainConfig);
     const workflowDefinitions = new WorkflowDefinitionsLibSQL(domainConfig);
     const memory = new MemoryLibSQL(domainConfig);
-    const knowledge = new KnowledgeLibSQL(domainConfig);
+    const knowledge = new KnowledgeLibSQL({
+      ...domainConfig,
+      storageIsolationKey: config.storageIsolationKey ?? getLibSQLKnowledgeIsolationKey(config, this.client),
+    });
     const observability = new ObservabilityLibSQL(domainConfig);
     const agents = new AgentsLibSQL(domainConfig);
     const channels = new ChannelsLibSQL(domainConfig);
@@ -274,7 +318,7 @@ export class LibSQLStore extends MastraCompositeStore {
     };
   }
 
-  private async applyLocalPragmas(): Promise<void> {
+  private async applyLocalPragmas(client: Client = this.client): Promise<void> {
     const pragmas = [
       ['journal_mode=WAL', 'PRAGMA journal_mode=WAL;'],
       // Keep in sync with the connection-level `timeout` passed to createClient
@@ -288,7 +332,7 @@ export class LibSQLStore extends MastraCompositeStore {
 
     for (const [label, sql] of pragmas) {
       try {
-        await this.client.execute(sql);
+        await client.execute(sql);
         this.logger.debug(`LibSQLStore: PRAGMA ${label} set.`);
       } catch (err) {
         this.logger.warn(`LibSQLStore: Failed to set PRAGMA ${label}.`, err);
@@ -297,7 +341,10 @@ export class LibSQLStore extends MastraCompositeStore {
   }
 
   private getStoresToInit() {
-    return Object.values(this.stores).filter(Boolean);
+    return Object.entries(this.stores)
+      .filter(([name]) => name !== 'knowledge')
+      .map(([, store]) => store)
+      .filter(Boolean);
   }
 
   private async initDomainsSequentially(): Promise<boolean> {
@@ -353,7 +400,7 @@ export class LibSQLStore extends MastraCompositeStore {
    */
   async close(): Promise<void> {
     if (!this.client.closed) {
-      this.client.close();
+      await this.client.close();
     }
   }
 }

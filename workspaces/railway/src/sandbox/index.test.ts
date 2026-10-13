@@ -8,7 +8,7 @@
  * - Process spawning, env/cwd passthrough, and kill
  */
 
-import { SandboxNotReadyError } from '@mastra/core/workspace';
+import { SandboxError, SandboxNotReadyError } from '@mastra/core/workspace';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { RailwaySandbox } from './index';
@@ -210,9 +210,113 @@ describe('RailwaySandbox', () => {
       expect(sandbox.status).toBe('running');
     });
 
+    it("reports outcomes: 'connected' on reattach, 'created' on provision and replacement", async () => {
+      mockConnect.mockResolvedValueOnce({ ...mockSandbox, id: 'rw-existing', status: 'RUNNING' });
+      const reattached = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing' });
+      await expect(reattached._start()).resolves.toEqual({ outcome: 'connected' });
+
+      const fresh = new RailwaySandbox({ token: 'tok', environmentId: 'env-1' });
+      await expect(fresh._start()).resolves.toEqual({ outcome: 'created' });
+
+      mockConnect.mockResolvedValueOnce({ ...mockSandbox, status: 'DESTROYED' });
+      mockCreate.mockResolvedValueOnce({ ...mockSandbox, id: 'rw-replacement', status: 'RUNNING' });
+      const replaced = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing' });
+      await expect(replaced._start()).resolves.toEqual({ outcome: 'created' });
+    });
+
+    describe("reattach: 'required'", () => {
+      it('throws SANDBOX_REATTACH_FAILED instead of provisioning when the sandbox is gone', async () => {
+        mockConnect.mockResolvedValue({ ...mockSandbox, status: 'DESTROYED' });
+        const sandbox = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing', reattach: 'required' });
+
+        const error = await sandbox._start().catch(e => e);
+
+        expect(error).toBeInstanceOf(SandboxError);
+        expect(error.code).toBe('SANDBOX_REATTACH_FAILED');
+        expect(error.details).toMatchObject({ provider: 'railway', sandboxId: 'rw-existing' });
+        expect(error.message).toContain('rw-existing');
+        expect(mockCreate).not.toHaveBeenCalled();
+        expect(sandbox.status).toBe('error');
+        expect(sandbox.sandboxId).toBe('rw-existing');
+
+        // A retry stays strict and still never provisions a replacement.
+        await expect(sandbox._start()).rejects.toMatchObject({ code: 'SANDBOX_REATTACH_FAILED' });
+        expect(mockCreate).not.toHaveBeenCalled();
+      });
+
+      it('throws when connect reports SandboxNotFoundError', async () => {
+        mockConnect.mockRejectedValueOnce(new MockSandboxNotFoundError('gone'));
+        const sandbox = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing', reattach: 'required' });
+
+        await expect(sandbox._start()).rejects.toMatchObject({ code: 'SANDBOX_REATTACH_FAILED' });
+        expect(mockCreate).not.toHaveBeenCalled();
+      });
+
+      it('rethrows non-not-found reattach errors unchanged', async () => {
+        const networkError = new Error('network down');
+        mockConnect.mockRejectedValueOnce(networkError);
+        const sandbox = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing', reattach: 'required' });
+
+        await expect(sandbox._start()).rejects.toBe(networkError);
+        expect(mockCreate).not.toHaveBeenCalled();
+      });
+
+      it('reattaches normally when the sandbox is running', async () => {
+        mockConnect.mockResolvedValueOnce({ ...mockSandbox, id: 'rw-existing', status: 'RUNNING' });
+        const sandbox = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing', reattach: 'required' });
+
+        await expect(sandbox._start()).resolves.toEqual({ outcome: 'connected' });
+        expect(mockCreate).not.toHaveBeenCalled();
+      });
+
+      it('provisions normally when no sandboxId is configured', async () => {
+        const sandbox = new RailwaySandbox({ token: 'tok', reattach: 'required' });
+
+        await expect(sandbox._start()).resolves.toEqual({ outcome: 'created' });
+        expect(mockCreate).toHaveBeenCalledTimes(1);
+      });
+
+      it('clone({ sandboxId }) inherits reattach and targets the given sandbox', async () => {
+        mockConnect.mockRejectedValueOnce(new MockSandboxNotFoundError('gone'));
+        const template = new RailwaySandbox({ token: 'tok', reattach: 'required' });
+
+        const child = template.clone({ id: 'child', sandboxId: 'rw-child' });
+
+        await expect(child._start()).rejects.toMatchObject({
+          code: 'SANDBOX_REATTACH_FAILED',
+          details: expect.objectContaining({ sandboxId: 'rw-child' }),
+        });
+        expect(mockConnect).toHaveBeenCalledWith('rw-child', expect.anything());
+        expect(mockCreate).not.toHaveBeenCalled();
+      });
+    });
+
     it('throws SandboxNotReadyError when accessing railway before start', () => {
       const sandbox = new RailwaySandbox({ token: 't' });
       expect(() => sandbox.railway).toThrow(SandboxNotReadyError);
+    });
+
+    it('exposes the created physical sandboxId after start', async () => {
+      const sandbox = new RailwaySandbox({ token: 'tok', environmentId: 'env-1' });
+      expect(sandbox.sandboxId).toBeUndefined();
+      await sandbox._start();
+      expect(sandbox.sandboxId).toBe('rw-sandbox-123');
+    });
+
+    it('reports the configured reattach id as sandboxId after reconnect', async () => {
+      mockConnect.mockResolvedValueOnce({ ...mockSandbox, id: 'rw-existing', status: 'RUNNING' });
+      const sandbox = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing' });
+      expect(sandbox.sandboxId).toBe('rw-existing');
+      await sandbox._start();
+      expect(sandbox.sandboxId).toBe('rw-existing');
+    });
+
+    it('reports the replacement physical sandboxId after a stale reattach', async () => {
+      mockConnect.mockResolvedValueOnce({ ...mockSandbox, status: 'DESTROYED' });
+      mockCreate.mockResolvedValueOnce({ ...mockSandbox, id: 'rw-replacement', status: 'RUNNING' });
+      const sandbox = new RailwaySandbox({ token: 'tok', sandboxId: 'rw-existing' });
+      await sandbox._start();
+      expect(sandbox.sandboxId).toBe('rw-replacement');
     });
 
     it('destroys the underlying sandbox', async () => {
@@ -590,6 +694,17 @@ describe('RailwaySandbox', () => {
       expect(sentOptions.timeoutSec).toBe(5);
     });
 
+    it('setEnv after construction reaches subsequent commands', async () => {
+      const sandbox = new RailwaySandbox({ token: 't' });
+      await sandbox._start();
+
+      sandbox.setEnv(env => ({ ...env, GH_TOKEN: 'tok_1' }));
+      await sandbox.executeCommand!('echo hello');
+
+      const sentOptions = mockSandbox.exec.mock.calls[0]![1] as { env?: Record<string, string> };
+      expect(sentOptions.env).toEqual(expect.objectContaining({ GH_TOKEN: 'tok_1' }));
+    });
+
     it('restarts a checkpoint-enabled sandbox when it is down before execution', async () => {
       const reconnectedSandbox = {
         ...mockSandbox,
@@ -612,6 +727,32 @@ describe('RailwaySandbox', () => {
       expect(reconnectedSandbox.exec).toHaveBeenCalledWith('echo hello', {});
       expect(result.stdout).toBe('after restart');
       expect(sandbox.status).toBe('running');
+    });
+
+    it('joins an in-flight start instead of throwing when executed concurrently', async () => {
+      let releaseCreate!: (value: unknown) => void;
+      mockCreate.mockReturnValueOnce(new Promise(resolve => (releaseCreate = resolve)));
+
+      const sandbox = new RailwaySandbox({ token: 't', checkpointName: 'checkpoint' });
+      const starting = sandbox._start();
+      const executing = sandbox.executeCommand!('echo hello');
+
+      releaseCreate(mockSandbox);
+      await starting;
+      const result = await executing;
+
+      expect(result.exitCode).toBe(0);
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws instead of self-joining when executed inside the in-flight start (bootstrap reentrancy)', async () => {
+      const sandbox = new RailwaySandbox({ token: 't', checkpointName: 'checkpoint' });
+      // Simulate the base-class bootstrap window: status already 'running'
+      // while the start attempt's promise is still in flight.
+      (sandbox as any)._startPromise = new Promise(() => {});
+      sandbox.status = 'running';
+
+      await expect(sandbox.executeCommand!('echo hello')).rejects.toThrow(SandboxNotReadyError);
     });
 
     it('works without checkpointing after an explicit start', async () => {
@@ -762,5 +903,34 @@ describe('exec cwd/env passthrough', () => {
     const sentOptions = mockSandbox.exec.mock.calls[0]![1] as Record<string, unknown>;
     expect(sentOptions).not.toHaveProperty('cwd');
     expect(sentOptions).not.toHaveProperty('env');
+    expect(sandbox.workingDirectory).toBeUndefined();
+  });
+
+  it('spawn defaults cwd to the configured workingDirectory', async () => {
+    const sandbox = new RailwaySandbox({ token: 't', workingDirectory: '/srv/app' });
+    await sandbox._start();
+    await sandbox.processes.spawn('ls');
+
+    const sentOptions = mockSandbox.exec.mock.calls[0]![1] as { cwd?: string };
+    expect(sentOptions.cwd).toBe('/srv/app');
+    expect(sandbox.workingDirectory).toBe('/srv/app');
+  });
+
+  it('per-spawn cwd wins over the configured workingDirectory', async () => {
+    const sandbox = new RailwaySandbox({ token: 't', workingDirectory: '/srv/app' });
+    await sandbox._start();
+    await sandbox.processes.spawn('ls', { cwd: '/app' });
+
+    const sentOptions = mockSandbox.exec.mock.calls[0]![1] as { cwd?: string };
+    expect(sentOptions.cwd).toBe('/app');
+  });
+
+  it('executeCommand defaults cwd to the configured workingDirectory', async () => {
+    const sandbox = new RailwaySandbox({ token: 't', workingDirectory: '/srv/app' });
+    await sandbox._start();
+    await sandbox.executeCommand('pwd');
+
+    const sentOptions = mockSandbox.exec.mock.calls[0]![1] as { cwd?: string };
+    expect(sentOptions.cwd).toBe('/srv/app');
   });
 });

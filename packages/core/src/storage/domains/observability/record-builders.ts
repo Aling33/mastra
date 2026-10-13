@@ -205,7 +205,7 @@ export function buildCreateSpanRecord(span: AnyExportedSpan): CreateSpanRecord {
     attributes: serializeSpanAttributes(span),
     metadata: span.metadata ?? null,
     tags: span.tags ?? null,
-    links: null,
+    links: span.links ?? null,
     input: span.input ?? null,
     output: span.output ?? null,
     error: span.errorInfo ?? null,
@@ -227,7 +227,7 @@ export function buildUpdateSpanRecord(span: AnyExportedSpan): Partial<UpdateSpan
     scope: null,
     attributes: serializeSpanAttributes(span),
     metadata: span.metadata ?? null,
-    links: null,
+    links: span.links ?? null,
     endedAt: span.endTime ?? null,
     input: span.input,
     output: span.output,
@@ -343,5 +343,6 @@ export function buildFeedbackRecord(event: FeedbackEvent): CreateFeedbackRecord 
     scope: null,
     sourceId: fb.sourceId ?? null,
     metadata: fb.metadata ?? null,
+    reviewStatus: 'needs-review',
   };
 }

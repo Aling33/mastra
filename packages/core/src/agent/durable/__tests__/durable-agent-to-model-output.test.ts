@@ -16,6 +16,7 @@ import { InMemoryStore } from '../../../storage';
 import { createTool } from '../../../tools';
 import { Agent } from '../../agent';
 import { createDurableAgent } from '../create-durable-agent';
+import { createEventedAgent } from '../create-evented-agent';
 import { globalRunRegistry } from '../run-registry';
 
 function createToolCallingModel(
@@ -83,7 +84,144 @@ describe('DurableAgent toModelOutput parity', () => {
     vi.restoreAllMocks();
   });
 
-  it('computes toModelOutput and merges into messageList providerMetadata', async () => {
+  it.each([
+    ['DurableAgent', (agent: Agent<any, any, any>) => createDurableAgent({ agent, pubsub })],
+    ['EventedAgent', (agent: Agent<any, any, any>) => createEventedAgent({ agent })],
+  ] as const)(
+    'fails the %s run when toModelOutput throws',
+    async (_agentType, createAgent) => {
+      const mappingError = new Error('tool output mapping failed');
+      const testTool = createTool({
+        id: 'throwing-mapper-tool',
+        description: 'A tool with a broken output mapper',
+        inputSchema: z.object({ query: z.string() }),
+        outputSchema: z.object({ data: z.string() }),
+        execute: async () => ({ data: 'tool result' }),
+        toModelOutput: () => {
+          throw mappingError;
+        },
+      });
+      const baseAgent = new Agent({
+        name: 'throwing-mapper-agent',
+        instructions: 'Use the tool.',
+        model: createToolCallingModel('throwing-mapper-tool', { query: 'test' }),
+        tools: { 'throwing-mapper-tool': testTool },
+      });
+      const agent = createAgent(baseAgent);
+
+      new Mastra({
+        agents: { 'throwing-mapper-agent': agent as any },
+        logger: false,
+        storage: new InMemoryStore(),
+      });
+
+      let receivedError: unknown;
+      let finished = false;
+      const { output, cleanup } = await agent.stream('Use the tool', {
+        onError: ({ error }) => {
+          receivedError = error;
+        },
+        onFinish: () => {
+          finished = true;
+        },
+      });
+
+      const chunks: any[] = [];
+      for await (const chunk of output.fullStream) {
+        chunks.push(chunk);
+      }
+
+      const streamedError = chunks.find(chunk => chunk.type === 'error')?.payload?.error;
+      expect(receivedError instanceof Error ? receivedError.message : String(receivedError)).toContain(
+        mappingError.message,
+      );
+      expect(streamedError instanceof Error ? streamedError.message : String(streamedError)).toContain(
+        mappingError.message,
+      );
+      expect(finished).toBe(false);
+      cleanup();
+    },
+    30_000,
+  );
+
+  it.each([
+    ['DurableAgent', (agent: Agent<any, any, any>) => createDurableAgent({ agent, pubsub })],
+    ['EventedAgent', (agent: Agent<any, any, any>) => createEventedAgent({ agent })],
+  ] as const)(
+    'fails the %s run when an awaited background tool toModelOutput throws',
+    async (_agentType, createAgent) => {
+      const mappingError = new Error('awaited background mapping failed');
+      const testTool = createTool({
+        id: 'awaited-background-mapper-tool',
+        description: 'An awaited background tool with a broken output mapper',
+        inputSchema: z.object({ query: z.string() }),
+        outputSchema: z.object({ data: z.string() }),
+        execute: async () => ({ data: 'background result' }),
+        toModelOutput: () => {
+          throw mappingError;
+        },
+        background: { enabled: true },
+      });
+      const baseAgent = new Agent({
+        name: 'awaited-background-mapper-agent',
+        instructions: 'Use the tool.',
+        model: createToolCallingModel('awaited-background-mapper-tool', {
+          query: 'test',
+          _background: { disposition: 'awaited' },
+        }),
+        tools: { 'awaited-background-mapper-tool': testTool },
+        backgroundTasks: { tools: { 'awaited-background-mapper-tool': true } },
+      });
+      const agent = createAgent(baseAgent);
+      const mastra = new Mastra({
+        agents: { 'awaited-background-mapper-agent': agent as any },
+        logger: false,
+        storage: new InMemoryStore(),
+        backgroundTasks: { enabled: true },
+        pubsub,
+      });
+      await mastra.startWorkers();
+
+      try {
+        let receivedError: unknown;
+        let finished = false;
+        const { output, cleanup } = await agent.stream('Use the tool', {
+          onError: ({ error }) => {
+            receivedError = error;
+          },
+          onFinish: () => {
+            finished = true;
+          },
+        });
+
+        try {
+          const chunks: any[] = [];
+          for await (const chunk of output.fullStream) {
+            chunks.push(chunk);
+          }
+
+          const streamedError = chunks.find(chunk => chunk.type === 'error')?.payload?.error;
+          expect(receivedError instanceof Error ? receivedError.message : String(receivedError)).toContain(
+            mappingError.message,
+          );
+          expect(streamedError instanceof Error ? streamedError.message : String(streamedError)).toContain(
+            mappingError.message,
+          );
+          expect(finished).toBe(false);
+        } finally {
+          cleanup();
+        }
+      } finally {
+        await mastra.stopWorkers?.();
+      }
+    },
+    30_000,
+  );
+
+  it.each([
+    ['DurableAgent', (agent: Agent<any, any, any>) => createDurableAgent({ agent, pubsub })],
+    ['EventedAgent', (agent: Agent<any, any, any>) => createEventedAgent({ agent })],
+  ] as const)('computes toModelOutput for %s', async (_agentType, createAgent) => {
     const toModelOutputSpy = vi.fn(result => ({
       type: 'content',
       value: [{ type: 'text', text: `Processed: ${result.data}` }],
@@ -107,14 +245,15 @@ describe('DurableAgent toModelOutput parity', () => {
       tools: { 'test-tool': testTool },
     });
 
-    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const agent = createAgent(baseAgent);
 
     new Mastra({
-      agents: { 'test-agent': durableAgent as any },
+      agents: { 'test-agent': agent as any },
+      logger: false,
       storage: new InMemoryStore(),
     });
 
-    const result = await durableAgent.stream('Use the test tool');
+    const result = await agent.stream('Use the test tool');
 
     // Consume the stream
     const chunks: any[] = [];
@@ -176,7 +315,7 @@ describe('DurableAgent toModelOutput parity', () => {
     expect(JSON.stringify(prompts[1])).toContain('model-facing content');
   });
 
-  it('normalizes image-url to media type in toModelOutput', async () => {
+  it('normalizes data-URI image-url to media type in toModelOutput', async () => {
     const toModelOutputSpy = vi.fn(() => ({
       type: 'content',
       value: [
@@ -221,7 +360,8 @@ describe('DurableAgent toModelOutput parity', () => {
     expect(toModelOutputSpy).toHaveBeenCalledTimes(1);
     // The normalization happens inside the mapping step — we verify the spy was called
     // and the stream completed without errors, which proves the normalizeModelOutput
-    // path was exercised (image-url → media conversion).
+    // path was exercised (data-URI image-url → media conversion; remote-URL image-url
+    // parts pass through untouched, see durable-agent-image-url-model-output.test.ts).
   });
 
   it('keeps the raw tool result when toModelOutput returns undefined', async () => {
@@ -341,4 +481,86 @@ describe('DurableAgent toModelOutput parity', () => {
       expect(Object.hasOwn(mastraMetadata, 'modelOutput')).toBe(false);
     },
   );
+
+  it('applies toModelOutput to a client-executed tool result arriving on a follow-up request', async () => {
+    const toModelOutputSpy = vi.fn((output: any) => ({
+      type: 'content',
+      value: [{ type: 'text', text: `Screenshot uploaded as ${output.fileId}` }],
+    }));
+
+    // Execute-less: the tool runs on the client; the server only maps the result.
+    const clientTool = createTool({
+      id: 'client-tool',
+      description: 'A client-side tool',
+      inputSchema: z.object({ query: z.string().optional() }),
+      toModelOutput: toModelOutputSpy,
+    });
+
+    const prompts: any[] = [];
+    const model = new MockLanguageModelV2({
+      doStream: async ({ prompt }) => {
+        prompts.push(prompt);
+        return {
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'response-metadata', id: 'resp-1', modelId: 'mock', timestamp: new Date(0) },
+            { type: 'text-start', id: 'text-1' },
+            { type: 'text-delta', id: 'text-1', delta: 'Done.' },
+            { type: 'text-end', id: 'text-1' },
+            { type: 'finish', finishReason: 'stop', usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 } },
+          ]),
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+        };
+      },
+    }) as unknown as LanguageModelV2;
+
+    const baseAgent = new Agent({
+      name: 'client-map-agent',
+      instructions: 'You are a test agent.',
+      model,
+      tools: { 'client-tool': clientTool },
+    });
+
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    new Mastra({
+      agents: { 'client-map-agent': durableAgent as any },
+      storage: new InMemoryStore(),
+    });
+
+    // Follow-up request shape from @mastra/client-js: previous assistant
+    // tool-call + the client-produced tool result.
+    const result = await durableAgent.stream([
+      {
+        role: 'assistant',
+        content: [{ type: 'tool-call', toolCallId: 'tc-client-1', toolName: 'client-tool', args: {} }],
+      },
+      {
+        role: 'tool',
+        content: [
+          { type: 'tool-result', toolCallId: 'tc-client-1', toolName: 'client-tool', result: { fileId: 'file-9' } },
+        ],
+      },
+    ] satisfies Parameters<typeof durableAgent.stream>[0]);
+
+    for await (const _chunk of result.fullStream) {
+      // drain
+    }
+
+    expect(toModelOutputSpy).toHaveBeenCalledTimes(1);
+    expect(toModelOutputSpy).toHaveBeenCalledWith({ fileId: 'file-9' });
+
+    // The model must see the mapped output, not the raw JSON result.
+    const toolResultParts = prompts
+      .flat()
+      .filter((m: any) => m.role === 'tool')
+      .flatMap((m: any) => m.content)
+      .filter((p: any) => p.type === 'tool-result' && p.toolCallId === 'tc-client-1');
+    expect(toolResultParts.length).toBeGreaterThan(0);
+    expect(toolResultParts[0].output).toEqual({
+      type: 'content',
+      value: [{ type: 'text', text: 'Screenshot uploaded as file-9' }],
+    });
+  });
 });

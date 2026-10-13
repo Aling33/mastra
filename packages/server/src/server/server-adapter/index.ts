@@ -22,6 +22,7 @@ import {
 } from '../constants';
 import type { MastraAuthMode } from '../constants';
 import { formatZodError } from '../handlers/error';
+import { HTTPException } from '../http-exception';
 export { isZodError, type ZodErrorLike } from '../handlers/error';
 import { normalizeRoutePath } from '../utils';
 import type { SetMcpRequestAuth } from './mcp-auth';
@@ -33,6 +34,7 @@ import { getBuiltInRouteFGAConfig } from './routes/fga-manifest';
 export * from './routes';
 export { applyMcpRequestAuth, buildMcpAuthInfoFromRequestContext } from './mcp-auth';
 export type { McpAuthInfo, SetMcpRequestAuth } from './mcp-auth';
+export { convertCustomRoutesToOpenAPIPaths } from './openapi-utils';
 export { redactStreamChunk } from './redact';
 export { serializeStreamChunk, type SerializedStreamChunk } from './serialize';
 export {
@@ -46,6 +48,15 @@ export {
 export type { MastraAuthMode } from '../constants';
 
 export { WorkflowRegistry, normalizeRoutePath } from '../utils';
+export { HTTPException };
+
+export function getCustomHTTPExceptionResponse(error: unknown): Response | undefined {
+  if (!(error instanceof HTTPException) || !error.res) {
+    return undefined;
+  }
+
+  return error.getResponse();
+}
 
 /**
  * Hono/adapter context key set by the framework-public middleware.
@@ -185,7 +196,7 @@ function isSchemaApiRoute(route: ApiRoute): route is SchemaCustomApiRoute {
   return '_mastraSchemaRoute' in route && route._mastraSchemaRoute === true;
 }
 
-function getFGAProvider(mastra: any, requestContext?: RequestContext): IFGAProvider | undefined {
+export function getFGAProvider(mastra: any, requestContext?: RequestContext): IFGAProvider | undefined {
   // If we have request context, check auth mode to determine which FGA provider to use
   if (requestContext) {
     const authMode = requestContext.get(MASTRA_AUTH_MODE_KEY);
@@ -304,6 +315,20 @@ function parseComplexQueryParams(
 }
 
 /**
+ * Property names that must never be written onto objects built from untrusted
+ * input: assigning them can mutate the object's prototype chain.
+ */
+const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+
+/**
+ * Returns whether `key` is safe to use as a property name when building an
+ * object from untrusted input (query strings, form fields, etc.).
+ */
+export function isSafeObjectKey(key: string): boolean {
+  return !UNSAFE_OBJECT_KEYS.has(key);
+}
+
+/**
  * Normalizes query parameters from various HTTP framework formats to a consistent structure.
  * Handles both single string values and arrays (for repeated query params like ?tag=a&tag=b).
  * Reconstructs bracket-notation keys (e.g., `orderBy[field]=createdAt`) into JSON strings
@@ -328,15 +353,20 @@ export function normalizeQueryParams(rawQuery: Record<string, unknown>): Record<
         : typeof value === 'string'
           ? value
           : undefined;
-      if (strValue !== undefined) {
-        if (!bracketGroups[parent]) {
+      if (strValue !== undefined && isSafeObjectKey(parent) && isSafeObjectKey(child)) {
+        if (!Object.hasOwn(bracketGroups, parent)) {
           bracketGroups[parent] = {};
         }
         bracketGroups[parent]![child] = strValue;
       }
     } else if (typeof value === 'string') {
-      queryParams[key] = value;
+      if (isSafeObjectKey(key)) {
+        queryParams[key] = value;
+      }
     } else if (Array.isArray(value)) {
+      if (!isSafeObjectKey(key)) {
+        continue;
+      }
       // Filter to only string values (some frameworks include nested objects)
       const stringValues = value.filter((v): v is string => typeof v === 'string');
       // Convert single-value arrays back to strings for compatibility
@@ -346,7 +376,7 @@ export function normalizeQueryParams(rawQuery: Record<string, unknown>): Record<
 
   // Merge bracket groups as JSON strings (only if the parent key wasn't already set directly)
   for (const [parent, children] of Object.entries(bracketGroups)) {
-    if (!(parent in queryParams)) {
+    if (!Object.hasOwn(queryParams, parent)) {
       queryParams[parent] = JSON.stringify(children);
     }
   }
@@ -387,6 +417,15 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
         executionCtx?: ExecutionContext,
       ) => Promise<Response>)
     | null = null;
+
+  /**
+   * Whether custom (non-schema) API routes were registered. Adapters use this
+   * at request time to decide if they need to preserve a pristine copy of the
+   * request body for the custom-route bridge.
+   */
+  protected get hasCustomRouteHandler(): boolean {
+    return this.customRouteHandler !== null;
+  }
 
   constructor({
     app,
@@ -792,8 +831,6 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
       pattern: `${prefix}${r.path}`,
     }));
 
-    const customAuthConfig = this.customRouteAuthConfig;
-
     return (path: string, method: string): boolean => {
       const upperMethod = method.toUpperCase();
 
@@ -803,7 +840,11 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
         }
       }
 
-      return isCustomRoutePublic(path, upperMethod, customAuthConfig);
+      // Read `customRouteAuthConfig` at request time, not at matcher build
+      // time: adapters constructed without an explicit map only populate it
+      // later, in registerCustomApiRoutes(), after the context middleware has
+      // already built this matcher.
+      return isCustomRoutePublic(path, upperMethod, this.customRouteAuthConfig);
     };
   }
 
@@ -818,6 +859,8 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   async init() {
     this.registerContextMiddleware();
     this.registerAuthMiddleware();
+    this.validateAuthResourceScoping();
+    this.registerUserMiddleware();
     this.registerHttpLoggingMiddleware();
     await this.validateEELicense();
     await this.validateAgentBuilderLicense();
@@ -895,6 +938,27 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
   }
 
   /**
+   * Warn when `server.auth` is configured without `mapUserToResourceId`.
+   *
+   * Without it, MASTRA_RESOURCE_ID_KEY is never set in the request context, so
+   * built-in routes fall back to the client-supplied resource ID (for example
+   * `memory.resource`) and ownership checks run against a caller-chosen value.
+   */
+  validateAuthResourceScoping(): void {
+    const auth = this.mastra.getServer()?.auth as { mapUserToResourceId?: unknown } | undefined;
+    if (!auth || typeof auth.mapUserToResourceId === 'function') return;
+
+    this.mastra
+      .getLogger()
+      ?.warn(
+        '[mastra/auth] server.auth is configured without mapUserToResourceId. ' +
+          'Memory, thread and workflow ownership checks will trust the resource ID supplied by the client ' +
+          "(e.g. memory.resource in the request body), so an authenticated user can read or write another user's threads. " +
+          'Configure server.auth.mapUserToResourceId to derive the resource ID from the authenticated user.',
+      );
+  }
+
+  /**
    * Validate route-level FGA policy coverage when an FGA provider opts into
    * startup checks.
    */
@@ -937,6 +1001,31 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
       routes: routeList,
       count: missingRoutes.length,
     });
+  }
+
+  /**
+   * Register user-provided middleware from the Mastra config (`server.middleware`)
+   * and from `mastra.setServerMiddleware()`. Called by init() between
+   * registerAuthMiddleware() and registerHttpLoggingMiddleware().
+   *
+   * Mastra middleware handlers use Hono's `(c, next)` signature, so only
+   * Hono-based adapters can run them. Those adapters override this method and
+   * MUST wrap each handler with `skipIfFrameworkPublic` (exported by
+   * `@mastra/hono`) so user middleware cannot block framework-public routes.
+   * The default implementation warns when middleware is configured so the
+   * config is not silently ignored on adapters that cannot honor it.
+   */
+  registerUserMiddleware(): void {
+    const instanceMiddleware = this.mastra.getServerMiddleware?.() ?? [];
+    const configMiddleware = this.mastra.getServer()?.middleware;
+    const hasConfigMiddleware = Array.isArray(configMiddleware) ? configMiddleware.length > 0 : !!configMiddleware;
+    if (instanceMiddleware.length === 0 && !hasConfigMiddleware) return;
+
+    this.mastra
+      .getLogger()
+      ?.warn(
+        'Mastra server middleware (`server.middleware` or `setServerMiddleware()`) is configured, but this server adapter cannot run Hono middleware handlers. The configured middleware will not run — register middleware through your server framework instead.',
+      );
   }
 
   /**
@@ -1273,6 +1362,19 @@ export abstract class MastraServer<TApp, TRequest, TResponse> extends MastraServ
     const bodySchema = route.bodySchema;
     if (!bodySchema) {
       return body;
+    }
+
+    if (body === undefined) {
+      const omitted = await bodySchema.safeParseAsync(undefined);
+      if (omitted.success) return omitted.data;
+      // Preserve bodyless object requests with optional/defaulted fields, but keep
+      // the original missing-input error if the compatibility fallback also fails.
+      const schemaType = getSchemaTypeName(unwrapOptionalNullable(bodySchema));
+      if (schemaType === 'object' || schemaType === 'ZodObject') {
+        const emptyObject = await bodySchema.safeParseAsync({});
+        if (emptyObject.success) return emptyObject.data;
+      }
+      throw omitted.error;
     }
 
     return bodySchema.parseAsync(body);

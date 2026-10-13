@@ -1,6 +1,6 @@
 ---
 title: "Reference: MastraModelOutput | Streaming"
-description: "Complete reference for MastraModelOutput - the stream object returned by agent.stream() with streaming and promise-based access to model outputs."
+description: "The MastraModelOutput class is returned by .stream() and provides both streaming and promise-based access to model outputs."
 packages:
   - "@mastra/core"
 ---
@@ -312,9 +312,8 @@ These properties resolve to final values after the stream completes:
   content={[
   {
     name: 'error',
-    type: 'string | Error | { message: string; stack: string; } | undefined',
-    description:
-      'Error information if the stream encountered an error. Undefined if no errors occurred. Can be a string message, Error object, or serialized error with stack trace.',
+    type: 'Error | undefined',
+    description: 'Error object if the stream encountered an error. Undefined if no errors occurred.',
   },
 ]}
 />

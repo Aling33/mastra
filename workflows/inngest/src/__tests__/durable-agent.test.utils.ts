@@ -18,6 +18,7 @@ import { DefaultStorage } from '@mastra/libsql';
 import { Inngest } from 'inngest';
 
 import { serve as inngestServe } from '../index';
+import { ensureInngestCliBinary } from './inngest-cli';
 
 export const INNGEST_PORT = 4100;
 export const HANDLER_PORT = 4101;
@@ -76,7 +77,7 @@ export async function waitForInngestSync(ms = 500): Promise<void> {
 }
 
 /**
- * Start the Inngest dev server using npx inngest-cli.
+ * Start the Inngest dev server using the inngest-cli binary.
  * Returns a promise that resolves when the server is ready.
  *
  * `sdkUrl` is the app serve URL the dev server polls for function sync. Pass `null` for tests whose
@@ -85,9 +86,9 @@ export async function waitForInngestSync(ms = 500): Promise<void> {
 async function startInngestDevServer({
   sdkUrl = `http://localhost:${HANDLER_PORT}/inngest/api`,
 }: { sdkUrl?: string | null } = {}): Promise<ChildProcess> {
+  const inngestBinary = ensureInngestCliBinary();
   return new Promise((resolve, reject) => {
     const args = [
-      'inngest-cli',
       'dev',
       '-p',
       String(INNGEST_PORT),
@@ -96,7 +97,7 @@ async function startInngestDevServer({
       '--no-discovery',
     ];
 
-    const proc = spawn('npx', args, {
+    const proc = spawn(inngestBinary, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: false,
     });
@@ -192,7 +193,9 @@ export async function startConnectInngestDevServer(): Promise<ChildProcess | nul
  *
  * This starts the Inngest dev server using npx (no Docker required).
  */
-export async function setupSharedTestInfrastructure(): Promise<void> {
+export async function setupSharedTestInfrastructure({
+  observability,
+}: { observability?: NonNullable<ConstructorParameters<typeof Mastra>[0]>['observability'] } = {}): Promise<void> {
   // Start Inngest dev server first (needs to be running before we create the app server)
   // Skip if INNGEST_DEV_EXTERNAL=true (for running against Docker or existing server)
   if (process.env.INNGEST_DEV_EXTERNAL !== 'true') {
@@ -223,6 +226,7 @@ export async function setupSharedTestInfrastructure(): Promise<void> {
     workflows: {
       [workflow.id]: workflow,
     },
+    ...(observability ? { observability } : {}),
     server: {
       apiRoutes: [
         {
