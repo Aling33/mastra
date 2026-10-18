@@ -8,6 +8,7 @@ import {
 import type { AgentSignalType, MastraDBMessage } from '@mastra/core/agent';
 import { filterSystemReminderMessages } from '@mastra/core/memory';
 import type { MemoryConfig } from '@mastra/core/memory';
+import { MessageHistory } from '@mastra/core/processors';
 import { RequestContext } from '@mastra/core/request-context';
 import { InMemoryStore } from '@mastra/core/storage';
 import type { MastraVector } from '@mastra/core/vector';
@@ -271,6 +272,85 @@ describe('Memory', () => {
         expect(systemMessage).not.toContain('<working_memory_data>\nnull');
       });
     });
+  });
+
+  describe.each(['Memory', 'MessageHistory'] as const)('Gemini working-memory replay via %s (#27231)', path => {
+    it.each([
+      [true, undefined],
+      [false, undefined],
+      [true, 'SIG_EXISTING'],
+    ] as const)(
+      'keeps parallel calls signed after save and recall (step markers: %s, existing signature: %s)',
+      async (withStepStarts, existingSignature) => {
+        const store = new InMemoryStore();
+        const memory = new Memory({ storage: store });
+        const thread = await memory.createThread({ threadId: 'gemini-thread', resourceId: 'gemini-resource' });
+        const parts: MastraDBMessage['content']['parts'] = [
+          ...(withStepStarts ? [{ type: 'step-start' as const }] : []),
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result',
+              toolCallId: 'wm',
+              toolName: 'updateWorkingMemory',
+              args: {},
+              result: 'ok',
+            },
+            providerMetadata: { google: { thoughtSignature: 'SIG_WM' } },
+          },
+          {
+            type: 'tool-invocation',
+            toolInvocation: {
+              state: 'result',
+              toolCallId: 'client',
+              toolName: 'suggestReplies',
+              args: {},
+              result: ['Hello'],
+            },
+            providerMetadata: {
+              google: { custom: 'keep', ...(existingSignature ? { thoughtSignature: existingSignature } : {}) },
+              mastra: { custom: 'keep' },
+            },
+          },
+        ];
+        const messages: MastraDBMessage[] = [
+          {
+            id: 'assistant-gemini',
+            role: 'assistant',
+            createdAt: new Date(),
+            threadId: thread.id,
+            resourceId: 'gemini-resource',
+            content: { format: 2, parts },
+          },
+        ];
+        const original = structuredClone(messages);
+        if (path === 'Memory') {
+          await memory.saveMessages({ messages });
+        } else {
+          const storage = await store.getStore('memory');
+          const history = new MessageHistory({ storage: storage! });
+          await history.persistMessages({ messages, threadId: thread.id, resourceId: 'gemini-resource' });
+        }
+        const recalled = await memory.recall({ threadId: thread.id, resourceId: 'gemini-resource' });
+        const prompt = new MessageList().add(recalled.messages, 'memory').get.all.aiV5.prompt();
+        const calls = prompt.flatMap(message =>
+          message.role === 'assistant' && Array.isArray(message.content)
+            ? message.content.filter(part => part.type === 'tool-call')
+            : [],
+        );
+        expect(calls).toEqual([
+          expect.objectContaining({
+            toolName: 'suggestReplies',
+            providerOptions: {
+              google: { custom: 'keep', thoughtSignature: existingSignature ?? 'SIG_WM' },
+              mastra: { custom: 'keep' },
+            },
+          }),
+        ]);
+        expect(JSON.stringify(prompt)).not.toContain('updateWorkingMemory');
+        expect(messages).toEqual(original);
+      },
+    );
   });
 
   describe('updateMessageToHideWorkingMemoryV2', () => {

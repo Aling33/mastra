@@ -138,6 +138,23 @@ export function removeWorkingMemoryToolInvocationParts(parts: MastraMessagePart[
   return steps.flatMap(step => {
     if (!step.some(isWorkingMemoryCall)) return step;
     const remaining = step.filter(part => !isWorkingMemoryCall(part));
+    // Gemini signs only the first parallel call; keep that signature when hiding it (#27231).
+    const thoughtSignature = step.find(
+      part => isWorkingMemoryCall(part) && part.providerMetadata?.google?.thoughtSignature,
+    )?.providerMetadata?.google?.thoughtSignature;
+    const firstToolIndex = remaining.findIndex(
+      part => part.type === 'tool-invocation' && part.toolInvocation.state !== 'partial-call',
+    );
+    const firstTool = remaining[firstToolIndex];
+    if (thoughtSignature && firstTool && !firstTool.providerMetadata?.google?.thoughtSignature) {
+      remaining[firstToolIndex] = {
+        ...firstTool,
+        providerMetadata: {
+          ...firstTool.providerMetadata,
+          google: { ...firstTool.providerMetadata?.google, thoughtSignature },
+        },
+      };
+    }
     const onlyReasoningLeft = remaining.every(
       part =>
         part?.type === 'step-start' ||

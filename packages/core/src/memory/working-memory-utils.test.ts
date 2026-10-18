@@ -313,6 +313,38 @@ describe('removeWorkingMemoryToolInvocationParts', () => {
     ]);
   });
 
+  it('keeps a stripped Gemini signature on the first non-streaming parallel call without mutating input (#27231)', () => {
+    const partial: MastraMessagePart = {
+      type: 'tool-invocation',
+      toolInvocation: { state: 'partial-call', toolCallId: 'partial', toolName: 'lookupWeather', args: {} },
+    };
+    const parts: MastraMessagePart[] = [
+      call('unsigned-wm', 'updateWorkingMemory'),
+      { ...call('wm', 'updateWorkingMemory'), providerMetadata: { google: { thoughtSignature: 'SIG' } } },
+      partial,
+      call('other', 'lookupWeather'),
+    ];
+    const original = structuredClone(parts);
+    const remaining = removeWorkingMemoryToolInvocationParts(parts);
+    expect(remaining).toEqual([
+      partial,
+      { ...call('other', 'lookupWeather'), providerMetadata: { google: { thoughtSignature: 'SIG' } } },
+    ]);
+    expect(parts).toEqual(original);
+  });
+
+  it('does not transfer a stripped Gemini signature into a different step (#27231)', () => {
+    const next: MastraMessagePart[] = [{ type: 'step-start' }, call('other', 'lookupWeather')];
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        reasoning,
+        { ...call('wm', 'updateWorkingMemory'), providerMetadata: { google: { thoughtSignature: 'SIG' } } },
+        ...next,
+      ]),
+    ).toEqual(next);
+  });
+
   it('leaves state-signal setWorkingMemory calls alone', () => {
     const parts: MastraMessagePart[] = [{ type: 'step-start' }, reasoning, call('wm', 'setWorkingMemory')];
     expect(removeWorkingMemoryToolInvocationParts(parts)).toBe(parts);
